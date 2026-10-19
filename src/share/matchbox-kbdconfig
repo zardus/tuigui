@@ -1,0 +1,4 @@
+# tuigui: window navigation only. No launchers, no close, no Alt+letter
+# (Alt+letter collides with menu mnemonics; Alt+Tab is grabbed by the host WM).
+<alt><shift>n=next
+<alt><shift>p=prev

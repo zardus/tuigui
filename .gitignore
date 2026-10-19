@@ -1,0 +1,4 @@
+result
+result-*
+tests/kitty/out/
+__pycache__/
