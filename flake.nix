@@ -18,7 +18,8 @@
     in {
       packages = forAll (pkgs: rec {
         xpra = pkgs.callPackage ./nix/xpra.nix { inherit xpra-src; };
-        tg = pkgs.callPackage ./nix/tg.nix { inherit xpra version; src = self; };
+        matchbox = pkgs.callPackage ./nix/matchbox.nix { };
+        tg = pkgs.callPackage ./nix/tg.nix { inherit xpra matchbox version; src = self; };
         default = tg;
       });
 

@@ -1,0 +1,15 @@
+matchbox matches key bindings against the raw modifier state, so with NumLock or CapsLock on
+(xpra mirrors kitty's lock state into the session) the grabbed Alt+Shift+n/p run no action.
+keys_grab already grabs every lock variant; ignore the same lock_mask when matching.
+
+--- a/src/wm.c
++++ b/src/wm.c
+@@ -1098,7 +1098,7 @@
+    while (entry != NULL)
+      {
+        if (XKeycodeToKeysym(w->dpy, e->keycode, entry->index) == entry->key
+-	   && e->state == entry->ModifierMask )
++	   && (e->state & ~w->config->kb->lock_mask) == entry->ModifierMask )
+ 	{
+ 	  switch (entry->action) 
+ 	    {

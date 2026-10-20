@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 # Fake-kitty smoke test for tg (no kitty, no GL, no X display needed).
 #
-# usage: TG=/path/to/tg [TG_RUNTIME_DIR=DIR] tests/fakekitty/run.sh [TEST...]
+# usage: TG=/path/to/tg [TG_SMOKE_DIR=DIR] tests/fakekitty/run.sh [TEST...]
 #   TG              tg to test, e.g. the dev-linked one from tests/dev-link.sh (required)
-#   TG_RUNTIME_DIR  scratch parent, wiped at start; must be short (AF_UNIX) (default /tmp/tg-smoke-$UID)
-#   TEST            any of 1 2 3 4 5 6 7 (default: all)
+#   TG_SMOKE_DIR    scratch parent, wiped at start; must be short (AF_UNIX) (default /tmp/tg-smoke-$UID).
+#                   Not TG_RUNTIME_DIR: the suite deletes it and kills every process that mentions it.
+#   TEST            any of 1 2 3 4 5 6 7 8 (default: all)
 #   RESIZE_AT       seconds after start when the fake terminal shrinks (default 8; raise it on a loaded host)
 #
 # Tests: 1 desktop/xdummy size, resize, exit status, frames, logs   2 client killed -> exit 4
 #        3 SIGTERM / SIGKILL to tg, then --gc                           4 seamless and xvfb variants of 1
 #        5 refusals start nothing                                     6 quick-exit hint
-#        7 Alt+Shift+F4 detach -> 0, dir removed
+#        7 Alt+Shift+F4 detach -> 0, dir removed                          8 client fails at startup -> 4, promptly
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 : "${TG:?set TG to the tg under test}"
-BASE=${TG_RUNTIME_DIR:-/tmp/tg-smoke-$UID}
+BASE=${TG_SMOKE_DIR:-/tmp/tg-smoke-$UID}
+[[ -z ${TG_RUNTIME_DIR:-} || $BASE != "$TG_RUNTIME_DIR" ]] ||
+  { echo "refusing to wipe TG_RUNTIME_DIR=$TG_RUNTIME_DIR; set TG_SMOKE_DIR instead"; exit 2; }
+unset TG_RUNTIME_DIR
 RESIZE_AT=${RESIZE_AT:-8}
 PASSES=0 FAILS=0
 
@@ -185,7 +189,7 @@ test3() {
   local fkpid=$!
   if ! R=$(session_dir "$rt" 90); then fail "t3: session became ready"; wait "$fkpid"; return; fi
   sleep 3
-  kill -TERM "$(cat "$R/tg.pid")"
+  check "t3: SIGTERM sent to tg" kill -TERM "$(cut -d" " -f1 "$R/tg.pid")"
   wait "$fkpid"; rc=$?
   check "t3: tg exit status $rc == 143 after SIGTERM" test "$rc" = 143
   check "t3: session dir kept" test -d "$R"
@@ -201,7 +205,7 @@ test3() {
   local dpy
   dpy=$(display_of "$R")
   sleep 3
-  kill -KILL "$(cat "$R/tg.pid")"
+  check "t3k: SIGKILL sent to tg" kill -KILL "$(cut -d" " -f1 "$R/tg.pid")"
   wait "$fkpid"
   TG_RUNTIME_DIR=$rt "$TG" --gc </dev/null | sed 's/^/     /'
   check "t3k: --gc removed the session dir after kill -9" test ! -e "$R"
@@ -239,11 +243,13 @@ test5() {
   refuse t5-nocmd "no COMMAND" fk "$BASE/t5-nocmd.bin" env TG_RUNTIME_DIR="$rt" "$TG"
   refuse t5-notfound "command not found" fk "$BASE/t5-notfound.bin" \
     env TG_RUNTIME_DIR="$rt" "$TG" no-such-command-xyz
-  refuse t5-longdir "tg: " fk "$BASE/t5-longdir.bin" env TG_RUNTIME_DIR="$long" "$TG" "$XTERM"
+  refuse t5-longdir "too long" fk "$BASE/t5-longdir.bin" env TG_RUNTIME_DIR="$long" "$TG" "$XTERM"
   check "t5-longdir: nothing started under the long path" nothing_running "$long"
   check "t5-longdir: no session dir under the long path" \
     test -z "$(find "$long" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)"
   rm -rf "$long"
+  mkdir -m 755 "$BASE/t5-mode"
+  refuse t5-mode "expected 700" fk "$BASE/t5-mode.bin" env TG_RUNTIME_DIR="$BASE/t5-mode" "$TG" "$XTERM"
 }
 
 test6() {
@@ -273,6 +279,28 @@ test7() {
   no_leftovers t7
 }
 
+# a client that exits before its hello: the server gets no exit-with-client, tg must stop it with `xpra stop`
+test8() {
+  local rt=$BASE/t8 out=$BASE/t8.bin rc t0 tc R
+  mkdir -m 700 "$rt"
+  t0=$SECONDS
+  DUR=60 fk "$out" env TG_RUNTIME_DIR="$rt" TG_CLIENT_ARGS=--bogus-option "$TG" -- "$XCLOCK" -update 1; rc=$?
+  R=$(dirname "$(compgen -G "$rt/*/tg.log" | head -1)")
+  check "t8: tg exit status $rc == 4 after a client startup failure" test "$rc" = 4
+  tc=$(python3 -I - "$R/tg.log" <<'EOF'
+import re, sys
+t = [sum(float(x) * m for x, m in zip(l.split()[0].split(":"), (3600, 60, 1))) for l in open(sys.argv[1])
+     if re.search(r"client pid|exit \d+$", l)]
+print(f"{t[-1] - t[0]:.1f}" if len(t) >= 2 else "?")
+EOF
+)
+  info "t8: tg returned $tc s after starting the client ($((SECONDS - t0)) s in all)"
+  check "t8: tg returned within 4 s of the client's start" python3 -I -c "import sys; sys.exit(not float(sys.argv[1]) < 4)" "$tc"
+  check "t8: message names the logs" has_seq "$out" "xpra client failed"
+  no_leftovers t8
+  [[ -n $R && $R != . ]] && rm -rf "$R"
+}
+
 cleanup() {
   local pids
   mapfile -t pids < <(procs "$BASE/")
@@ -287,7 +315,7 @@ main() {
   SHM_BEFORE=$(shm_objects)
   trap cleanup EXIT
   local tests=("$@") t
-  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7)
+  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8)
   for t in "${tests[@]}"; do echo "== test $t"; "test$t"; done
   echo "== $PASSES passed, $FAILS failed (outputs in $BASE)"
   ((FAILS == 0))

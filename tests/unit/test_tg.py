@@ -1,5 +1,10 @@
+import io
 import os
+import shlex
+import signal
+import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -50,6 +55,18 @@ class ParseArgs(unittest.TestCase):
         with self.assertRaises(tg.Usage):
             tg.parse_args(["-x", "xterm"])
 
+    def test_clustered_short_options(self):
+        opts, cmd = tg.parse_args(["-sv", "xterm"])
+        self.assertEqual((opts["seamless"], opts["verbose"], cmd), (True, 1, ["xterm"]))
+        opts, _ = tg.parse_args(["-vs", "xterm"])
+        self.assertEqual((opts["seamless"], opts["verbose"]), (True, 1))
+        self.assertEqual(tg.parse_args(["-vvv", "x"])[0]["verbose"], 3)
+
+    def test_unknown_letter_in_cluster_names_the_token(self):
+        with self.assertRaises(tg.Usage) as cm:
+            tg.parse_args(["-sx", "xterm"])
+        self.assertIn("'-sx'", cm.exception.args[0])
+
     def test_help_and_version_need_no_command(self):
         self.assertTrue(tg.parse_args(["--help"])[0]["help"])
         self.assertTrue(tg.parse_args(["-V"])[0]["version"])
@@ -74,6 +91,11 @@ class CheckTerminal(unittest.TestCase):
         cause, _ = tg.check_terminal({"STY": "123.pts-0", "TERM": "xterm-kitty"}, True, True)
         self.assertIn("inside screen", cause)
 
+    def test_zellij(self):
+        cause, _ = tg.check_terminal({"ZELLIJ": "0", "ZELLIJ_SESSION_NAME": "x", "TERM": "xterm-kitty",
+                                      "KITTY_WINDOW_ID": "1"}, True, True)
+        self.assertIn("inside zellij", cause)
+
     def test_kitty_by_window_id(self):
         self.assertIsNone(tg.check_terminal({"KITTY_WINDOW_ID": "3", "TERM": "xterm-256color"}, True, True))
 
@@ -97,6 +119,10 @@ class RuntimeDir(unittest.TestCase):
         env = {"TG_RUNTIME_DIR": "/t", "XDG_RUNTIME_DIR": "/run/user/1000"}
         self.assertEqual(tg.runtime_bases(env, 1000), ["/t", "/run/user/1000/tg", "/tmp/tg-1000"])
         self.assertEqual(tg.runtime_bases({}, 1000), ["/tmp/tg-1000"])
+
+    def test_relative_bases_are_made_absolute(self):
+        self.assertEqual(tg.runtime_bases({"TG_RUNTIME_DIR": "rt"}, 1000)[0], os.path.join(os.getcwd(), "rt"))
+        self.assertEqual(tg.runtime_bases({"XDG_RUNTIME_DIR": "run"}, 1000)[0], os.path.join(os.getcwd(), "run", "tg"))
 
     def test_budget(self):
         self.assertTrue(tg.fits_af_unix("/run/user/1000/tg", "laptop"))
@@ -160,8 +186,12 @@ class Environments(unittest.TestCase):
         e = tg.xpra_env(USER, R, True)
         self.assertEqual(e["XDG_RUNTIME_DIR"], R)
         self.assertEqual(e["XDG_CONFIG_HOME"], R + "/cfg")
+        self.assertEqual(e["XPRA_SYSTEM_CONF_DIRS"], tg.XPRA_PREFIX + "/etc/xpra")
+        self.assertEqual(e["XPRA_USER_CONF_DIRS"], R + "/cfg/xpra")
         a = tg.app_env(USER, R, ":5")
         self.assertNotIn("XDG_CONFIG_HOME", a)
+        self.assertNotIn("XPRA_SYSTEM_CONF_DIRS", a)
+        self.assertNotIn("XPRA_USER_CONF_DIRS", a)
         self.assertEqual(a["XDG_RUNTIME_DIR"], "/run/user/1000")
 
     def test_app_env(self):
@@ -216,6 +246,17 @@ class ServerCmd(unittest.TestCase):
         cmd = tg.build_server_cmd(DESKTOP, R, 9, None, "xdummy", ["--bell=yes", "-d", "x11"])
         self.assertEqual(cmd[-3:], ["--bell=yes", "-d", "x11"])
 
+    def test_paths_with_spaces_survive_xpras_shlex_split(self):
+        r = "/tmp/my tg/ab'cd"
+        cmd = tg.build_server_cmd(DESKTOP, r, 9, None, "xdummy", [])
+        xvfb = shlex.split(next(a for a in cmd if a.startswith("--xvfb="))[len("--xvfb="):])
+        self.assertIn(r + "/Xauthority", xvfb)
+        self.assertEqual(xvfb[xvfb.index("-logfile") + 1], r + "/Xorg.log")
+        self.assertEqual(xvfb[xvfb.index("-configdir") + 1], r + "/xorg.conf.d")
+        xvfb = shlex.split(next(a for a in tg.build_server_cmd(DESKTOP, r, 9, None, "xvfb", [])
+                                if a.startswith("--xvfb="))[len("--xvfb="):])
+        self.assertEqual(xvfb[-1], r + "/Xauthority")
+
     def test_displayfd_uses_given_fd(self):
         self.assertIn("--displayfd=17", tg.build_server_cmd(DESKTOP, R, 17, None, "xdummy", []))
 
@@ -231,7 +272,7 @@ class ServerCmd(unittest.TestCase):
 class ClientCmd(unittest.TestCase):
     def test_snapshot(self):
         self.assertEqual(tg.build_client_cmd(DESKTOP, R, []), [
-            tg.XPRA, "attach", f"socket://{R}/x.sock", "--backend=terminal",
+            tg.XPRA, "attach", f"socket://{R}/x.sock", "--backend=terminal", "--reconnect=no",
             "--speaker=no", "--microphone=no", "--audio=no", "--webcam=no", "--notifications=no", "--printing=no",
             "--file-transfer=no", "--open-files=no", "--open-url=no", "--tray=no", "--mdns=no",
             "--shortcut-modifiers=meta+shift", "--key-shortcut=clear", "--key-shortcut=#+F4:quit"])
@@ -273,13 +314,18 @@ class FakeProc:
 class ExitClassification(unittest.TestCase):
     """Session.connection_ended: the client or the server went away; None means still running."""
 
-    def classify(self, client_rc, server_rc):
+    def classify(self, client_rc, server_rc, sig=None):
         with tempfile.TemporaryDirectory() as R, mock.patch.object(tg, "wait_until", return_value=False):
             S = tg.Session(R, {"seamless": False, "verbose": 0}, ["app"], {})
             self.addCleanup(os.close, S.rwake)
             self.addCleanup(os.close, S.wwake)
-            S.client, S.server = FakeProc(client_rc), FakeProc(server_rc)
+            S.client, S.server, S.sig = FakeProc(client_rc), FakeProc(server_rc), sig
+            self.messages = S.messages
             return S.connection_ended()
+
+    def test_group_signal_wins_over_the_dead_client(self):
+        self.assertEqual(self.classify(-signal.SIGHUP, None, signal.SIGHUP), 128 + signal.SIGHUP)
+        self.assertEqual(self.messages, [])
 
     def test_detach(self):
         self.assertEqual(self.classify(0, None), 0)
@@ -295,6 +341,196 @@ class ExitClassification(unittest.TestCase):
         self.assertEqual(self.classify(0, -9), 3)
         self.assertEqual(self.classify(None, 0), 3)        # the client did not follow within the grace period
         self.assertEqual(self.classify(None, None), 3)     # the X server died under a live xpra server
+
+
+
+def session(R):
+    S = tg.Session(R, {"seamless": False, "verbose": 0}, ["app"], {})
+    os.close(S.rwake)
+    os.close(S.wwake)
+    return S
+
+
+class ForeignAppGroup(unittest.TestCase):
+    """COMMAND escalated to root (pkexec, sudo): signalling its group fails with EPERM."""
+
+    def test_eperm_means_alive_and_teardown_completes(self):
+        with tempfile.TemporaryDirectory() as R, \
+                mock.patch.object(tg.os, "killpg", side_effect=PermissionError(1, "EPERM")), \
+                mock.patch.object(tg, "wait_until", return_value=False), \
+                mock.patch.object(tg, "session_pids", return_value=[]):
+            S = session(R)
+            S.app = mock.Mock(pid=4242)
+            self.assertTrue(S.app_group_alive())
+            tg.killpg_quiet(4242, signal.SIGTERM)
+            S.teardown()
+            self.assertEqual(S.survivors, [4242])
+            self.assertIn("still running: 4242", S.messages[0][0])
+
+    def test_kill_quiet_ignores_eperm(self):
+        with mock.patch.object(tg.os, "kill", side_effect=PermissionError(1, "EPERM")):
+            tg.kill_quiet(1, signal.SIGTERM)
+
+    def test_a_failing_step_does_not_skip_the_rest(self):
+        with tempfile.TemporaryDirectory() as R:
+            S = session(R)
+            calls = []
+            S.terminate_client = mock.Mock(side_effect=RuntimeError("boom"), __name__="terminate_client")
+            for name in ("restore_tty", "stop_server", "stop_app", "stop_strays"):
+                setattr(S, name, mock.Mock(side_effect=lambda n=name: calls.append(n), __name__=name))
+            S.teardown()
+            self.assertEqual(calls, ["restore_tty", "stop_server", "stop_app", "stop_strays"])
+
+
+class SessionPids(unittest.TestCase):
+    """session_pids matches the variables tg sets and the session's own binaries, not any mention of R."""
+
+    def spawn(self, argv, env, executable=None):
+        p = subprocess.Popen(argv, env=env, executable=executable, stdin=subprocess.DEVNULL)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        return p.pid
+
+    def test_matches(self):
+        with tempfile.TemporaryDirectory() as R:
+            sleeper = ["/bin/sh", "-c", "sleep 30; :", "x"]       # '; :' keeps sh from exec'ing sleep
+            base = {"PATH": "/usr/bin:/bin"}
+            pager = self.spawn(sleeper + [R + "/tg.log"], {**base, "PWD": R})
+            other = self.spawn(sleeper, {**base, "XDG_RUNTIME_DIR": R + "x"})
+            ours = [self.spawn(sleeper, {**base, "XDG_RUNTIME_DIR": R}),
+                    self.spawn(sleeper, {**base, "TG_SESSION": R}),
+                    self.spawn(sleeper, {**base, "XAUTHORITY": R + "/Xauthority"})]
+            xorg = self.spawn(["/fake/Xorg-for-Xpra-1", "-c", "import time; time.sleep(30)", "-auth",
+                               R + "/Xauthority"], base, executable=sys.executable)
+            def renamed():
+                with open(f"/proc/{xorg}/cmdline", "rb") as f:
+                    return f.read().startswith(b"/fake/Xorg-")
+            tg.wait_until(renamed, 5)
+            with mock.patch.object(tg, "XORG", "/fake/Xorg"):
+                found = set(tg.session_pids(R))
+            for p in ours + [xorg]:
+                self.assertIn(p, found)
+            self.assertNotIn(pager, found)
+            self.assertNotIn(other, found)
+
+
+class RuntimeDirFiles(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp", prefix="tgu")
+        self.addCleanup(self.tmp.cleanup)
+        self.uid = os.getuid()
+
+    def test_symlink_base_refused(self):
+        os.mkdir(self.tmp.name + "/real", 0o700)
+        os.symlink(self.tmp.name + "/real", self.tmp.name + "/link")
+        with self.assertRaises(tg.Usage):
+            tg.prepare_base(self.tmp.name + "/link", self.uid)
+
+    def test_mode_755_base_refused(self):
+        os.mkdir(self.tmp.name + "/b")
+        os.chmod(self.tmp.name + "/b", 0o755)
+        with self.assertRaises(tg.Usage) as cm:
+            tg.prepare_base(self.tmp.name + "/b", self.uid)
+        self.assertIn("expected 700", cm.exception.args[0])
+
+    def test_fresh_base_is_700(self):
+        tg.prepare_base(self.tmp.name + "/new", self.uid)
+        self.assertEqual(stat.S_IMODE(os.stat(self.tmp.name + "/new").st_mode), 0o700)
+
+    def test_dollar_in_base_refused(self):
+        with self.assertRaises(tg.Usage):
+            tg.prepare_base(self.tmp.name + "/$HOME", self.uid)
+
+    def test_make_runtime_dir(self):
+        R = tg.make_runtime_dir({"TG_RUNTIME_DIR": self.tmp.name + "/rt"})
+        for sub in ("s", "cfg", "xpra", "xorg.conf.d"):
+            self.assertTrue(os.path.isdir(os.path.join(R, sub)))
+        self.assertEqual(stat.S_IMODE(os.stat(R + "/Xauthority").st_mode), 0o600)
+        with open(R + "/tg.pid") as f:
+            self.assertEqual(f.read().split()[0], str(os.getpid()))
+        self.assertTrue(tg.session_alive(R))
+
+    def test_too_long(self):
+        with self.assertRaises(tg.Usage) as cm:
+            tg.make_runtime_dir({"TG_RUNTIME_DIR": "/tmp/" + "x" * 115})
+        self.assertIn("too long", cm.exception.args[0])
+
+    def write_pid(self, text):
+        R = self.tmp.name + "/s"
+        os.makedirs(R, exist_ok=True)
+        with open(R + "/tg.pid", "w") as f:
+            f.write(text)
+        return R
+
+    def test_session_alive_checks_the_start_time(self):
+        me = os.getpid()
+        self.assertTrue(tg.session_alive(self.write_pid(f"{me} {tg.proc_start(me).decode()}\n")))
+        self.assertFalse(tg.session_alive(self.write_pid(f"{me} 1\n")))      # pid reused by another process
+        self.assertFalse(tg.session_alive(self.write_pid(f"{me}\n")))        # old one-field format
+        self.assertFalse(tg.session_alive(self.write_pid("garbage")))
+        p = subprocess.Popen(["true"])
+        p.wait()
+        self.assertFalse(tg.session_alive(self.write_pid(f"{p.pid} 1\n")))
+        self.assertTrue(tg.pid_alive(me))
+        self.assertFalse(tg.pid_alive(p.pid))
+
+    def gc(self, base):
+        out, errs = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", errs):
+            tg.gc({"TG_RUNTIME_DIR": base})
+        return out.getvalue(), errs.getvalue()
+
+    def test_gc_removes_dead_sessions(self):
+        base = self.tmp.name + "/rt"
+        os.mkdir(base, 0o700)
+        R = base + "/abcdef"
+        os.mkdir(R, 0o700)
+        with open(R + "/tg.pid", "w") as f:
+            f.write(f"{os.getpid()} 1\n")
+        out, _ = self.gc(base)
+        self.assertEqual(out, f"tg: removed {R}\n")
+        self.assertFalse(os.path.exists(R))
+
+    def test_gc_skips_unsafe_bases_and_entries(self):
+        real = self.tmp.name + "/real"
+        os.mkdir(real, 0o700)
+        os.mkdir(real + "/abcdef")
+        open(real + "/abcdef/tg.pid", "w").close()
+        os.symlink(real, self.tmp.name + "/link")
+        out, errs = self.gc(self.tmp.name + "/link")
+        self.assertEqual(out, "")
+        self.assertIn("skipping", errs)
+        os.chmod(real, 0o755)
+        out, errs = self.gc(real)
+        self.assertEqual(out, "")
+        self.assertIn("expected 700", errs)
+        os.chmod(real, 0o700)
+        os.symlink(real + "/abcdef", real + "/linked")
+        os.rename(real + "/abcdef", self.tmp.name + "/elsewhere")
+        os.symlink(self.tmp.name + "/elsewhere", real + "/abcdef")
+        out, _ = self.gc(real)
+        self.assertEqual(out, "")
+        self.assertTrue(os.path.exists(self.tmp.name + "/elsewhere/tg.pid"))
+
+
+class MainValidation(unittest.TestCase):
+    def main(self, env):
+        errs = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(tg, "check_terminal", return_value=None), \
+                mock.patch.object(tg.shutil, "which", return_value="/usr/bin/xterm"), \
+                mock.patch.object(tg, "make_runtime_dir", side_effect=AssertionError("session started")), \
+                mock.patch.object(sys, "stderr", errs):
+            return tg.main(["xterm"]), errs.getvalue()
+
+    def test_bad_timeout_and_xserver(self):
+        self.assertEqual(self.main({"TG_TIMEOUT": "abc"})[0], 2)
+        self.assertEqual(self.main({"TG_XSERVER": "foo"})[0], 2)
+
+    def test_unbalanced_quotes(self):
+        for var in ("TG_SERVER_ARGS", "TG_CLIENT_ARGS"):
+            rc, errs = self.main({var: "--shortcut-modifiers='control+shift"})
+            self.assertEqual(rc, 2)
+            self.assertIn(f"tg: {var}: No closing quotation", errs)
 
 
 if __name__ == "__main__":

@@ -56,7 +56,8 @@ usage: tg [-s] [-v] [--] COMMAND [ARGS...]
 tg starts a private X server and xpra session, runs COMMAND in it and shows
 it in this terminal through the kitty graphics protocol. The program fills
 the terminal and follows its size. tg exits when COMMAND exits, or when you
-press Alt+Shift+F4 to detach, which also ends COMMAND.
+press Alt+Shift+F4 to detach, which also ends COMMAND (in seamless mode only
+while COMMAND has a window).
 
 options:
   -s, --seamless   draw each X window where it is instead of one fitted desktop
@@ -76,7 +77,7 @@ environment: TG_XSERVER=xdummy|xvfb  TG_RUNTIME_DIR=DIR  TG_TIMEOUT=SECS
 exit status: COMMAND's own; 2 usage/environment, 3 server failed, 4 client
 failed, 128+N when interrupted by signal N.
 Logs: $XDG_RUNTIME_DIR/tg/<id>/ (kept with -v or after a failure).
-Does not work inside tmux or screen."""
+Does not work inside tmux, screen or zellij."""
 
 
 class Usage(Exception):
@@ -97,6 +98,7 @@ def err(cause, action=None):
 def parse_args(argv):
     """Returns (opts, cmd). Options stop at the first non-option or '--'."""
     opts = {"seamless": False, "verbose": 0, "gc": False, "help": False, "version": False}
+    argv = list(argv)
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -105,12 +107,15 @@ def parse_args(argv):
             break
         if not a.startswith("-") or a == "-":
             break
+        if len(a) > 2 and a[1] != "-":            # clustered short options: -sv, -vv
+            if not all(c in "svhV" for c in a[1:]):
+                raise Usage(f"unknown option {a!r}", "see tg --help")
+            argv[i:i + 1] = ["-" + c for c in a[1:]]
+            continue
         if a in ("-s", "--seamless"):
             opts["seamless"] = True
         elif a in ("-v", "--verbose"):
             opts["verbose"] += 1
-        elif a == "-vv":
-            opts["verbose"] += 2
         elif a in ("-h", "--help"):
             opts["help"] = True
         elif a in ("-V", "--version"):
@@ -134,8 +139,8 @@ def check_terminal(env, isatty0, isatty1):
     """Returns None or (cause, action)."""
     if not (isatty0 and isatty1):
         return ("stdin and stdout must be the kitty terminal", None)
-    if env.get("TMUX") or env.get("STY"):
-        mux = "tmux" if env.get("TMUX") else "screen"
+    if env.get("TMUX") or env.get("STY") or env.get("ZELLIJ"):
+        mux = "tmux" if env.get("TMUX") else "screen" if env.get("STY") else "zellij"
         return (f"refusing to run inside {mux}: {mux} does not pass the kitty graphics and keyboard protocols through.",
                 "open a plain kitty window or tab and run tg there.")
     if env.get("TG_FORCE_TERMINAL") == "1":
@@ -151,9 +156,9 @@ def runtime_bases(env, uid):
     """Every parent directory tg may use, in order of preference (--gc scans them all)."""
     out = []
     if env.get("TG_RUNTIME_DIR"):
-        out.append(env["TG_RUNTIME_DIR"])
+        out.append(os.path.abspath(env["TG_RUNTIME_DIR"]))
     if env.get("XDG_RUNTIME_DIR"):
-        out.append(os.path.join(env["XDG_RUNTIME_DIR"], "tg"))
+        out.append(os.path.join(os.path.abspath(env["XDG_RUNTIME_DIR"]), "tg"))
     out.append(f"/tmp/tg-{uid}")
     return out
 
@@ -186,6 +191,9 @@ def xpra_env(env, R, with_xauth):
     e = {k: v for k, v in env.items() if k not in XPRA_SCRUB}
     e["XDG_RUNTIME_DIR"] = R
     e["XDG_CONFIG_HOME"] = os.path.join(R, "cfg")
+    # only the pinned build's conf.d: not /etc/xpra, /etc/xdg/xpra, ~/.xpra or ~/.config/xpra
+    e["XPRA_SYSTEM_CONF_DIRS"] = XPRA_PREFIX + "/etc/xpra"
+    e["XPRA_USER_CONF_DIRS"] = os.path.join(R, "cfg", "xpra")
     if with_xauth:
         e["XAUTHORITY"] = os.path.join(R, "Xauthority")
     return e
@@ -199,14 +207,15 @@ def app_env(env, R, display):
 
 def build_server_cmd(opts, R, w_fd, size, xserver, extra):
     sub = "start" if opts["seamless"] else "start-desktop"
-    xa = os.path.join(R, "Xauthority")
+    q = shlex.quote                            # xpra shlex-splits --xvfb and --start-late
+    xa = q(os.path.join(R, "Xauthority"))
     if xserver == "xvfb":
-        xvfb = (f"{XVFB} -screen 0 7680x4320x24 +extension GLX +extension RANDR +extension RENDER "
+        xvfb = (f"{q(XVFB)} -screen 0 7680x4320x24 +extension GLX +extension RANDR +extension RENDER "
                 f"+extension Composite -extension DOUBLE-BUFFER -nolisten tcp -noreset -auth {xa}")
     else:
-        xvfb = (f"{XORG} -noreset -novtswitch -nolisten tcp +extension GLX +extension RANDR +extension RENDER "
-                f"+extension Composite -extension DOUBLE-BUFFER -auth {xa} -logfile {R}/Xorg.log "
-                f"-configdir {R}/xorg.conf.d -config {XPRA_PREFIX}/etc/xpra/xorg.conf")
+        xvfb = (f"{q(XORG)} -noreset -novtswitch -nolisten tcp +extension GLX +extension RANDR +extension RENDER "
+                f"+extension Composite -extension DOUBLE-BUFFER -auth {xa} -logfile {q(R + '/Xorg.log')} "
+                f"-configdir {q(R + '/xorg.conf.d')} -config {q(XPRA_PREFIX + '/etc/xpra/xorg.conf')}")
     cmd = [XPRA, sub, "--daemon=no", f"--displayfd={w_fd}",
            f"--bind={R}/x.sock", f"--socket-dirs={R}", f"--socket-dir={R}", f"--sessions-dir={R}/s",
            f"--log-dir={R}", "--exit-with-client=yes", "--exit-with-children=no", "--start-new-commands=no",
@@ -217,12 +226,16 @@ def build_server_cmd(opts, R, w_fd, size, xserver, extra):
         # --start-late: xpra records the root cursor at setup as "default" and never draws it; with --start,
         # matchbox could set its arrow first and the arrow then went invisible over most windows
         cmd += [f"--resize-display={rd}",
-                f"--start-late={MATCHBOX} -use_titlebar no -use_cursor yes -kbdconfig {SHARE}/matchbox-kbdconfig"]
+                (f"--start-late={q(MATCHBOX)} -use_titlebar no -use_cursor yes "
+                 f"-kbdconfig {q(SHARE + '/matchbox-kbdconfig')}")]
     return cmd + QUIET + extra
 
 
 def build_client_cmd(opts, R, extra):
-    cmd = [XPRA, "attach", f"socket://{R}/x.sock", "--backend=terminal"] + CLIENT_QUIET + SHORTCUTS
+    # --reconnect=no: a lost connection means the server is gone (--exit-with-client), so a re-exec'd client
+    # would only print another banner on the restored tty
+    cmd = ([XPRA, "attach", f"socket://{R}/x.sock", "--backend=terminal", "--reconnect=no"]
+           + CLIENT_QUIET + SHORTCUTS)
     if opts["verbose"] >= 2:
         cmd += ["-d", "terminal"]
     return cmd + extra
@@ -255,17 +268,28 @@ def pid_alive(pid):
     return data[data.rindex(b")") + 2:][:1] != b"Z"
 
 
+def proc_start(pid):
+    """starttime (field 22 of /proc/PID/stat) of a live, non-zombie process, else None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    fields = data[data.rindex(b")") + 2:].split()   # fields[0] is the state (field 3)
+    return None if fields[0] == b"Z" else fields[19]
+
+
 def killpg_quiet(pgid, sig):
     try:
         os.killpg(pgid, sig)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):  # EPERM: not ours to signal (e.g. COMMAND became root)
         pass
 
 
 def kill_quiet(pid, sig):
     try:
         os.kill(pid, sig)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
 
 
@@ -283,9 +307,13 @@ def kill_pids_with_grace(pids, secs):
 
 
 def session_pids(R):
-    """Our processes that carry R in their command line or environment, i.e. everything a session started
-    (xpra and Xorg name R in their arguments, the WM and COMMAND inherit it through XDG_RUNTIME_DIR/TG_SESSION)."""
-    marks = (R.encode() + b"/", R.encode() + b"\0")
+    """Our processes that a session started: those whose environment has one of the variables tg sets to R
+    (xpra, Xorg, the WM: XDG_RUNTIME_DIR; COMMAND and its children: TG_SESSION, XAUTHORITY), plus the session's
+    xpra, X server or WM binaries naming R in their arguments. A pager or shell that merely mentions R is not."""
+    r = R.encode()
+    env_marks = (b"\0XDG_RUNTIME_DIR=" + r + b"\0", b"\0TG_SESSION=" + r + b"\0",
+                 b"\0XAUTHORITY=" + r + b"/Xauthority\0")
+    exes = tuple(p.encode() for p in (XPRA_PREFIX + "/bin/", XORG, XVFB, MATCHBOX))
     uid, me, out = os.getuid(), os.getpid(), []
     for name in os.listdir("/proc"):
         if not name.isdigit() or int(name) == me:
@@ -293,18 +321,21 @@ def session_pids(R):
         try:
             if os.stat(f"/proc/{name}").st_uid != uid:
                 continue
+            with open(f"/proc/{name}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
         except OSError:
             continue
-        for part in ("cmdline", "environ"):
-            try:
-                with open(f"/proc/{name}/{part}", "rb") as f:
-                    data = f.read() + b"\0"
-            except OSError:
-                continue
-            if any(m in data for m in marks):
-                if pid_alive(int(name)):
-                    out.append(int(name))
-                break
+        try:
+            with open(f"/proc/{name}/environ", "rb") as f:
+                environ = b"\0" + f.read() + b"\0"
+        except OSError:              # the xpra server makes itself non-dumpable: environ is root-only
+            environ = b""
+        # argv[0]: the X server or WM (a prefix, since xpra renames Xorg's to "<Xorg>-for-Xpra-<display>");
+        # argv[1]: xpra's script under its python interpreter
+        mine = (any(m in environ for m in env_marks)
+                or (any(a.startswith(exes) for a in argv[:2]) and any(r + b"/" in a for a in argv[1:])))
+        if mine and pid_alive(int(name)):
+            out.append(int(name))
     return out
 
 
@@ -358,7 +389,19 @@ class Progress:
 
 # ---------- runtime directory ----------
 
+def base_problem(st, uid, check_mode=True):
+    """Why a runtime base with lstat result st must not be used, or None."""
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+        return "is not a directory owned by you (or is a symlink)"
+    if check_mode and stat.S_IMODE(st.st_mode) != 0o700:
+        return f"has mode {stat.S_IMODE(st.st_mode):o}, expected 700"
+    return None
+
+
 def prepare_base(base, uid):
+    if "$" in base:
+        raise Usage(f"the runtime directory {base} contains '$', which xpra expands.",
+                    "set TG_RUNTIME_DIR to a plain path.")
     created = False
     try:
         os.makedirs(base, 0o700)
@@ -368,15 +411,13 @@ def prepare_base(base, uid):
     except OSError as e:
         raise Usage(f"cannot create the runtime directory {base}: {e.strerror}.",
                     "set TG_RUNTIME_DIR to a short writable directory.")
-    st = os.lstat(base)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
-        raise Usage(f"the runtime directory {base} is not a directory owned by you (or is a symlink).",
-                    "remove it or set TG_RUNTIME_DIR to another directory.")
+    problem = base_problem(os.lstat(base), uid, check_mode=not created)
+    if problem:
+        raise Usage(f"the runtime directory {base} {problem}.",
+                    f"run chmod 700 {base}, or set TG_RUNTIME_DIR to another directory." if "mode" in problem
+                    else "remove it or set TG_RUNTIME_DIR to another directory.")
     if created:
         os.chmod(base, 0o700)
-    elif stat.S_IMODE(st.st_mode) != 0o700:
-        raise Usage(f"the runtime directory {base} has mode {stat.S_IMODE(st.st_mode):o}, expected 700.",
-                    f"run chmod 700 {base}, or set TG_RUNTIME_DIR to another directory.")
 
 
 def make_runtime_dir(env):
@@ -396,20 +437,22 @@ def make_runtime_dir(env):
             break
         except FileExistsError:
             continue
+    # first, so that --gc can reclaim R if tg is interrupted while setting it up
+    with open(os.path.join(R, "tg.pid"), "w") as f:
+        f.write(f"{os.getpid()} {proc_start(os.getpid()).decode()}\n")
     os.chmod(R, 0o700)
     for sub in ("s", "cfg", "xpra", "xorg.conf.d"):
         os.mkdir(os.path.join(R, sub), 0o700)
     os.close(os.open(os.path.join(R, "Xauthority"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-    with open(os.path.join(R, "tg.pid"), "w") as f:
-        f.write(f"{os.getpid()}\n")
     return R
 
 
 # ---------- the session ----------
 
 class Session:
-    def __init__(self, R, opts, cmd, env):
+    def __init__(self, R, opts, cmd, env, server_extra=(), client_extra=()):
         self.R, self.opts, self.cmd, self.env = R, opts, cmd, env
+        self.server_extra, self.client_extra = list(server_extra), list(client_extra)
         self.sock = f"socket://{R}/x.sock"
         self.started = time.time()
         self.server = self.app = self.client = None
@@ -420,6 +463,7 @@ class Session:
         self.client_terminated = self.client_killed = False
         self.done = False
         self.survivors = []
+        self.foreign_survivors = False
         self.messages = []           # (cause, action, log file to tail); printed after the tty is restored
         self.rwake, self.wwake = os.pipe()
         os.set_blocking(self.wwake, False)
@@ -453,8 +497,7 @@ class Session:
 
     def start_server(self, size):
         r, w = os.pipe()
-        extra = shlex.split(self.env.get("TG_SERVER_ARGS", ""))
-        cmd = build_server_cmd(self.opts, self.R, w, size, self.env.get("TG_XSERVER", "xdummy"), extra)
+        cmd = build_server_cmd(self.opts, self.R, w, size, self.env.get("TG_XSERVER", "xdummy"), self.server_extra)
         self.note("server: " + shlex.join(cmd))
         with open(os.path.join(self.R, "server.log"), "ab") as serverlog:
             self.server = subprocess.Popen(cmd, env=xpra_env(self.env, self.R, True), start_new_session=True,
@@ -523,8 +566,7 @@ class Session:
 
     def start_client(self):
         self.saved_tty = termios.tcgetattr(0)
-        extra = shlex.split(self.env.get("TG_CLIENT_ARGS", ""))
-        cmd = build_client_cmd(self.opts, self.R, extra)
+        cmd = build_client_cmd(self.opts, self.R, self.client_extra)
         self.client = subprocess.Popen(cmd, env=xpra_env(self.env, self.R, False))
         self.note(f"client pid {self.client.pid}: {shlex.join(cmd)}")
 
@@ -598,6 +640,9 @@ class Session:
 
     def connection_ended(self):
         """The client or the server went away: decides which one ended the session."""
+        if self.sig:            # a group-wide signal (window closed, kill -- -pgid) took the client with us
+            self.note(f"signal {self.sig}")
+            return 128 + self.sig
         wait_until(lambda: self.client.poll() is not None, 5)          # the client follows a dying server
         crc, src = self.client.poll(), self.server.poll()
         self.note(f"client {'alive' if crc is None else f'exited {crc}'}, "
@@ -636,6 +681,8 @@ class Session:
         try:
             os.killpg(self.app.pid, 0)
             return True
+        except PermissionError:       # EPERM: members exist but are not ours to signal (COMMAND became root)
+            return True
         except ProcessLookupError:
             return False
 
@@ -671,23 +718,25 @@ class Session:
 
     def stop_server(self):
         if self.server and self.server.poll() is None:
-            # Once a client has attached, its exit already makes the server terminate (--exit-with-client) and
-            # `xpra stop` can hang on the closing socket; before readiness the socket may not answer at all.
-            if self.ready and self.client is None:
+            # An attached client's exit usually makes the server terminate by itself (--exit-with-client); a client
+            # that never completed its hello does not. `xpra stop` can hang on a closing socket (bounded by the
+            # timeout), and before readiness the socket may not answer at all.
+            if self.ready and not wait_until(lambda: self.server.poll() is not None, 1 if self.client else 0):
                 self.note("teardown: xpra stop")
                 try:
                     subprocess.run([XPRA, "stop", self.sock], env=xpra_env(self.env, self.R, True), timeout=3,
                                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except subprocess.TimeoutExpired:
                     pass
-            if not wait_until(lambda: self.server.poll() is not None, 5 if self.ready else 0):
+            if not wait_until(lambda: self.server.poll() is not None, 3 if self.ready else 0):
                 self.note("teardown: server still running, SIGTERM to its group")
                 killpg_quiet(self.server.pid, signal.SIGTERM)
                 if not wait_until(lambda: self.server.poll() is not None, 3):
                     killpg_quiet(self.server.pid, signal.SIGKILL)
                     self.server.wait()
             self.note(f"server stopped, status {self.server.returncode}")
-        left = kill_pids_with_grace(self.x_pids | self.read_x_pids(), 3)
+        # only pids that are still this session's: the recorded X server pid may have been reused
+        left = kill_pids_with_grace((self.x_pids | self.read_x_pids()) & set(session_pids(self.R)), 3)
         if left:
             self.note(f"teardown: X server {left} survived SIGKILL")
 
@@ -697,52 +746,75 @@ class Session:
             killpg_quiet(self.app.pid, signal.SIGTERM)
             if not wait_until(lambda: not self.app_group_alive(), 2):
                 killpg_quiet(self.app.pid, signal.SIGKILL)
-                wait_until(lambda: not self.app_group_alive(), 1)
+                if not wait_until(lambda: not self.app_group_alive(), 1):
+                    # session_pids() skips processes that are not ours, so it would not report these
+                    self.note(f"teardown: app group {self.app.pid} not ours to signal, left running")
+                    self.survivors.append(self.app.pid)
+                    self.foreign_survivors = True
 
     def teardown(self):
         """Client first (tty back within ~1 s), then the server and X, then COMMAND's group. Idempotent."""
         if self.done:
             return
         self.done = True
-        self.terminate_client()
-        self.restore_tty()
-        self.stop_server()
-        self.stop_app()
-        # anything that escaped the steps above (an X server whose xpra died before writing xvfb.pid, a
-        # double-forked child of COMMAND) still carries R in its arguments or environment
-        if not wait_until(lambda: not session_pids(self.R), 2):
-            self.note(f"teardown: stopping stray processes {session_pids(self.R)}")
-            self.survivors = kill_pids_with_grace(session_pids(self.R), 2)
+        for step in (self.terminate_client, self.restore_tty, self.stop_server, self.stop_app, self.stop_strays):
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001 -- one failing step must not skip the others
+                self.note(f"teardown: {step.__name__} failed: {e!r}")
         if self.survivors:
             self.note(f"teardown: survivors {self.survivors}")
+            action = ("they are not yours to signal (COMMAND escalated privileges); stop them as root."
+                      if self.foreign_survivors else "run tg --gc to stop them once they are no longer needed.")
             self.messages.append((f"processes of this session are still running: {' '.join(map(str, self.survivors))}.",
-                                  "run tg --gc to stop them once they are no longer needed.", None))
+                                  action, None))
         else:
             self.note("teardown: complete")
+
+    def stop_strays(self):
+        # anything that escaped the steps above (an X server whose xpra died before writing xvfb.pid, a
+        # double-forked child of COMMAND) still carries R in its environment
+        if not wait_until(lambda: not session_pids(self.R), 2):
+            self.note(f"teardown: stopping stray processes {session_pids(self.R)}")
+            self.survivors += kill_pids_with_grace(session_pids(self.R), 2)
 
 
 # ---------- --gc ----------
 
 def session_alive(R):
+    """Whether the tg that created R still runs: its pid and start time (immune to pid reuse) match tg.pid."""
     try:
         with open(os.path.join(R, "tg.pid")) as f:
-            pid = int(f.read().strip())
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return b"tg" in f.read() and pid_alive(pid)
+            pid, start = f.read().split()
+        return proc_start(int(pid)) == start.encode()
     except (OSError, ValueError):
         return False
 
 
 def gc(env):
-    seen = set()
-    for base in runtime_bases(env, os.getuid()):
+    seen, uid = set(), os.getuid()
+    for base in runtime_bases(env, uid):
+        try:
+            st = os.lstat(base)
+        except OSError:
+            continue
+        problem = base_problem(st, uid)
+        if problem:
+            err(f"skipping {base}: it {problem}")
+            continue
         try:
             names = sorted(os.listdir(base))
         except OSError:
             continue
         for name in names:
             R = os.path.join(base, name)
-            if R in seen or not any(os.path.exists(os.path.join(R, f)) for f in ("meta.json", "tg.pid")):
+            try:
+                st = os.lstat(R)
+            except OSError:
+                continue
+            if R in seen or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+                continue
+            if not any(os.path.exists(os.path.join(R, f)) for f in ("meta.json", "tg.pid")):
                 continue
             seen.add(R)
             if session_alive(R):
@@ -752,7 +824,10 @@ def gc(env):
             shutil.rmtree(R, ignore_errors=True)
             n = len(pids) - len(left)
             stopped = f", stopped {n} process{'' if n == 1 else 'es'}" if pids else ""
-            print(f"tg: removed {R}{stopped}")
+            if os.path.lexists(R):
+                err(f"could not remove {R}")
+            else:
+                print(f"tg: removed {R}{stopped}")
             if left:
                 err(f"could not stop {' '.join(map(str, left))}")
     return 0
@@ -791,6 +866,13 @@ def main(argv):
     if env.get("TG_XSERVER", "xdummy") not in ("xdummy", "xvfb"):
         err(f"TG_XSERVER must be xdummy or xvfb, not {env['TG_XSERVER']!r}.")
         return 2
+    extra = {}
+    for var in ("TG_SERVER_ARGS", "TG_CLIENT_ARGS"):
+        try:
+            extra[var] = shlex.split(env.get(var, ""))
+        except ValueError as e:
+            err(f"{var}: {e}.")
+            return 2
     try:
         R = make_runtime_dir(env)
     except Usage as e:
@@ -799,7 +881,7 @@ def main(argv):
     if env.get("SSH_CONNECTION"):
         err("remote terminal: shared-memory transfer is unavailable, expect higher CPU")
 
-    S = Session(R, opts, cmd, env)
+    S = Session(R, opts, cmd, env, extra["TG_SERVER_ARGS"], extra["TG_CLIENT_ARGS"])
     for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, S.on_signal)
     code = 1                                  # an unexpected exception keeps the logs

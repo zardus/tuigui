@@ -4,12 +4,13 @@
 # Usage: harness.sh start [-- cmd args...] | stop | status | ls | sock | wid | raise
 #        | send <text> | sendkey <key>... | text [get-text args] | wait-text <regex> [timeout_s] | kitten <args...>
 #        | screenshot <out.png> [--window] | xkey <keysym>... | xtype <text> | xclick <x> <y> [btn] | xmove <x> <y>
-# Env: KH_DIR (/tmp/claude-1000/tgi-e2e/kh) state dir; the kitty class and socket are derived from it, so
-#      instances with different KH_DIRs never collide.  KH_DISPLAY (:175) KH_W KH_H KH_FONT KH_KITTY_OPTS
+# Env: KH_DIR (/tmp/tg-e2e-$UID/kh) state dir; the kitty class and socket are derived from it, so
+#      instances with different KH_DIRs never collide.  KH_DISPLAY (required): a dedicated X display such as an
+#      Xvfb on :175, never your desktop (the harness injects XTEST input there).  KH_W KH_H KH_FONT KH_KITTY_OPTS
 #      KH_NIXPKGS (flake ref, default nixpkgs)
 set -euo pipefail
-HDIR="${KH_DIR:-/tmp/claude-1000/tgi-e2e/kh}"
-export DISPLAY="${KH_DISPLAY:-:175}"
+HDIR="${KH_DIR:-/tmp/tg-e2e-$UID/kh}"
+export DISPLAY="${KH_DISPLAY:?set KH_DISPLAY to a dedicated X display for the kitty harness (e.g. an Xvfb on :175)}"
 # unix socket paths are limited to 108 bytes -> use a Linux abstract socket keyed on HDIR
 ID="kh-$(printf %s "$HDIR" | md5sum | cut -c1-12)"
 SOCKNAME=$ID CLASS=$ID PIDF="$HDIR/kitty.pid" LOG="$HDIR/kitty.log" PATHS="$HDIR/.nixpaths"
@@ -89,5 +90,5 @@ case "$cmd" in
     if running; then pid=$(cat "$PIDF"); kill "$pid"; for _ in $(seq 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
       kill -0 "$pid" 2>/dev/null && kill -9 "$pid"; echo "stopped $pid"; else echo "not running"; fi
     rm -f "$PIDF" ;;
-  *) sed -n '2,9p' "$0"; exit 2 ;;
+  *) sed -n '2,10p' "$0"; exit 2 ;;
 esac

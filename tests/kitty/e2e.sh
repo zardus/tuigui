@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end test of tg in a real kitty, driven by tests/kitty/harness.sh on an X display.
 #
-# usage: TG=/path/to/tg [KH_DIR=DIR] [TG_RUNTIME_DIR=DIR] tests/kitty/e2e.sh [STEP...]
+# usage: TG=/path/to/tg KH_DISPLAY=:N [KH_DIR=DIR] [TG_E2E_DIR=DIR] tests/kitty/e2e.sh [STEP...]
 #   TG              tg to test (required), e.g. the dev-linked one from tests/dev-link.sh
-#   KH_DIR          harness state dir (default /tmp/claude-1000/tgi-e2e/kh); step 10 adds a second one, KH_DIR-2
-#   TG_RUNTIME_DIR  parent of the per-round runtime dirs, wiped at start; keep it short (default /tmp/claude-1000/tgi-e2e/rt)
-#   KH_DISPLAY      X display for kitty (default :175)
+#   KH_DISPLAY      a dedicated X display for kitty, e.g. an Xvfb on :175 (required; gets XTEST input)
+#   KH_DIR          harness state dir (default /tmp/tg-e2e-$UID/kh); step 10 adds a second one, KH_DIR-2
+#   TG_E2E_DIR      parent of the per-round runtime dirs, wiped at start; keep it short (default /tmp/tg-e2e-$UID/rt).
+#                   Not TG_RUNTIME_DIR: the suite deletes it and kills every process that mentions it.
 #   STEP            any of 1 3 4 5 6 2 7 8 9 10 11 (default: all, in that order: 3-6 reuse the session of step 1)
 #
 # Steps: 1 fill + size   2 typing   3 resize   4 pointer   5 window switching   6 shortcuts + detach
@@ -17,11 +18,15 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 : "${TG:?set TG to the tg under test}"
 H=$HERE/harness.sh
-export KH_DIR=${KH_DIR:-/tmp/claude-1000/tgi-e2e/kh}
+export KH_DIR=${KH_DIR:-/tmp/tg-e2e-$UID/kh}
 KH_DIR2=$KH_DIR-2
-RT=${TG_RUNTIME_DIR:-/tmp/claude-1000/tgi-e2e/rt}
+RT=${TG_E2E_DIR:-/tmp/tg-e2e-$UID/rt}
+[[ -z ${TG_RUNTIME_DIR:-} || $RT != "$TG_RUNTIME_DIR" ]] ||
+  { echo "refusing to wipe TG_RUNTIME_DIR=$TG_RUNTIME_DIR; set TG_E2E_DIR instead"; exit 2; }
+unset TG_RUNTIME_DIR
 OUT=$HERE/out
-export KH_DISPLAY=${KH_DISPLAY:-:175}
+: "${KH_DISPLAY:?set KH_DISPLAY to a dedicated X display for the kitty harness (e.g. an Xvfb on :175)}"
+export KH_DISPLAY
 PASSES=0 FAILS=0
 R=""  # session dir of the round in progress
 
@@ -32,6 +37,7 @@ info() { echo "     $*"; }
 
 # nixbin PKG BIN: a tool from nixpkgs as locked by this repo's flake
 nixbin() { echo "$(nix build --no-link --print-out-paths --inputs-from "$REPO" "nixpkgs#$1" | head -1)/bin/$2"; }
+PY3=$(nixbin python3 python3)   # the harness kitty shell may have no python3 on PATH
 
 onhost() { DISPLAY=$KH_DISPLAY "$@"; }
 # on R's X display
@@ -101,12 +107,25 @@ pixels() {
   "$MAGICK" "$1" -fill black +opaque "$2" -fill white -opaque "$2" -format '%[fx:int(mean*w*h)]' info:
 }
 
-# wait_red NAME: a red xterm covers >= 60% of the 999x684 text area within 90 s
+# measure_cells: CW x CH, the cell size of the harness kitty, from TIOCGWINSZ in its shell; TW x TH, the text area
+# of the 1000x700 window. The expected X screen sizes follow from it (the harness kitty has no window padding).
+measure_cells() {
+  "$H" send "clear; $PY3 -c 'import fcntl,termios,struct; r,c,x,y=struct.unpack(\"HHHH\",fcntl.ioctl(0,termios.TIOCGWINSZ,bytes(8))); print(\"tg-cell\", x//c, y//r)'\\r" >/dev/null
+  "$H" wait-text 'tg-cell [0-9]+ [0-9]+' 10 >/dev/null || return 1
+  read -r CW CH < <("$H" text | sed -n 's/^tg-cell \([0-9]*\) \([0-9]*\).*/\1 \2/p' | tail -1)
+  ((CW > 0 && CH > 0)) || return 1
+  TW=$((1000 / CW * CW)) TH=$((700 / CH * CH))
+  info "cell ${CW}x${CH}, text area of a 1000x700 window ${TW}x${TH}"
+}
+# expect W H: the X screen size for a W x H kitty window
+expect() { echo "$(($1 / CW * CW))x$(($2 / CH * CH))"; }
+
+# wait_red NAME: a red xterm covers >= 60% of the text area within 90 s
 wait_red() {
   local end=$((SECONDS + 90)) n=0 f
   while ((SECONDS < end)); do
     f=$(shot "$1"); n=$(pixels "$f" red)
-    ((n >= 999 * 684 * 6 / 10)) && { info "$1: $n red pixels"; return 0; }
+    ((n >= TW * TH * 6 / 10)) && { info "$1: $n red pixels"; return 0; }
     sleep 2
   done
   info "$1: only $n red pixels"; return 1
@@ -129,7 +148,7 @@ mostly() {
   local end=$((SECONDS + 8)) n=0
   while ((SECONDS < end)); do
     n=$(pixels "$(shot "$1")" "$2")
-    ((n >= 999 * 684 / 2)) && return 0
+    ((n >= TW * TH / 2)) && return 0
     sleep 0.5
   done
   info "$1: only $n $2 pixels"; return 1
@@ -157,16 +176,18 @@ step1() {
   round a -v -- "$XTERM" -bg red -fa Monospace -fs 11
   check "1: session started" wait_session a || return
   check "1: red xterm fills >= 60% of the text area" wait_red s1-fill
-  check "1: X screen is the 999x684 text area" wait_xsize 999x684 5
+  check "1: X screen is the $(expect 1000 700) text area" wait_xsize "$(expect 1000 700)" 5
 }
 
 step3() {
   local w; w=$("$H" wid)
-  onhost "$XDOTOOL" windowsize "$w" 1400 900; check "3: resize to 1400x900 -> 1395x893" wait_xsize 1395x893 5
+  onhost "$XDOTOOL" windowsize "$w" 1400 900
+  check "3: resize to 1400x900 -> $(expect 1400 900)" wait_xsize "$(expect 1400 900)" 5
   shot s3-1400x900 >/dev/null
-  onhost "$XDOTOOL" windowsize "$w" 700 500; check "3: resize to 700x500 -> 693x494" wait_xsize 693x494 5
+  onhost "$XDOTOOL" windowsize "$w" 700 500; check "3: resize to 700x500 -> $(expect 700 500)" wait_xsize "$(expect 700 500)" 5
   shot s3-700x500 >/dev/null
-  onhost "$XDOTOOL" windowsize "$w" 1000 700; check "3: back to 1000x700 -> 999x684" wait_xsize 999x684 5
+  onhost "$XDOTOOL" windowsize "$w" 1000 700
+  check "3: back to 1000x700 -> $(expect 1000 700)" wait_xsize "$(expect 1000 700)" 5
 }
 
 step4() {
@@ -206,6 +227,14 @@ step5() {
   info "5: stacking [$first] -> alt+shift+n [$after_n] -> alt+shift+p [$after_p]"
   check "5: alt+shift+n raises another window" test -n "$first" -a "$first" != "$after_n"
   check "5: alt+shift+p restores the order" test "$after_p" = "$first"
+  # xpra mirrors kitty's NumLock into the session; matchbox must ignore it when matching its bindings
+  "$H" xkey Num_Lock; sleep 1
+  info "5: NumLock in the session: $(inx "$XSET" q | sed -n 's/.*\(Num Lock: *[a-z]*\).*/\1/p')"
+  "$H" xkey alt+shift+n; sleep 1
+  check "5: alt+shift+n raises another window with NumLock on" test "$(stacking)" != "$first"
+  "$H" xkey alt+shift+p; sleep 1
+  check "5: alt+shift+p restores the order with NumLock on" test "$(stacking)" = "$first"
+  "$H" xkey Num_Lock; sleep 1
   kill "$clock"; wait "$clock" 2>/dev/null
 }
 
@@ -254,14 +283,14 @@ step8() {
   check "8: client crash ends tg with 4 (got '$rc')" test "$rc" = 4
   check "8: prompt usable" tty_cooked 8
   f=$(shot s8-after-crash)
-  check "8: no frozen xclock image (white pixels < 2%)" test "$(pixels "$f" white)" -lt $((999 * 684 / 50))
+  check "8: no frozen xclock image (white pixels < 2%)" test "$(pixels "$f" white)" -lt $((TW * TH / 50))
   check "8: session processes gone" gone "$RT/d/" 10
 }
 
 step9() {
   round e -- "$XCLOCK" -update 1
   check "9: session started" wait_session e || return
-  kill -HUP "$(cat "$R/tg.pid")"
+  check "9: SIGHUP sent to tg" kill -HUP "$(cut -d" " -f1 "$R/tg.pid")"
   check "9: SIGHUP to tg leaves nothing running within 10 s" gone "$RT/e/" 10
   check "9: tty is cooked again" tty_cooked 9
 }
@@ -341,12 +370,13 @@ main() {
   rm -rf "$RT" && (umask 077 && mkdir -p "$RT" "$OUT")
   XTERM=$(nixbin xterm xterm) XCLOCK=$(nixbin xclock xclock) XRANDR=$(nixbin xrandr xrandr) XEV=$(nixbin xev xev)
   XDOTOOL=$(nixbin xdotool xdotool) MAGICK=$(nixbin imagemagick magick) GWF=$(nixbin gtk3.dev gtk3-widget-factory)
-  XWININFO=$(nixbin xwininfo xwininfo)
+  XWININFO=$(nixbin xwininfo xwininfo) XSET=$(nixbin xset xset)
   local before shm_before t
   before=$(home_state) shm_before=$(ls /dev/shm/xpra-terminal-* 2>/dev/null)
   trap cleanup EXIT
   "$H" start >/dev/null || { echo "FAIL kitty harness did not start"; exit 1; }
   sleep 2
+  measure_cells || { echo "FAIL could not measure the kitty cell size"; exit 1; }
   local steps=("$@")
   ((${#steps[@]})) || steps=(1 3 4 5 6 2 7 8 9 10 11)
   for t in "${steps[@]}"; do echo "== step $t"; "step$t"; done

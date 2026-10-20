@@ -98,8 +98,11 @@ kitty
   otherwise as base64-encoded images in the terminal stream.
 - **Isolation**: every session has its own directory (`$TG_RUNTIME_DIR/<id>`) holding the xpra socket, the
   Xauthority file and xpra's runtime and config directories. Nothing under `$HOME` is written. The X display number is
-  picked by the X server, so several `tg` sessions can run at the same time. COMMAND gets your environment plus
-  `DISPLAY`, `XAUTHORITY` and variables that make GTK, Qt, Firefox and SDL use X11 instead of a host Wayland session.
+  picked by the X server, so several `tg` sessions can run at the same time. The host's xpra configuration
+  (`/etc/xpra`, `/etc/xdg/xpra`, `~/.xpra`, `~/.config/xpra`) is not read. COMMAND gets your environment, minus
+  `WAYLAND_DISPLAY`, plus `DISPLAY`, `XAUTHORITY` (the session's Xauthority file), `TG_SESSION` (the path of the
+  session directory, where the logs below are written) and variables that make GTK, Qt, Firefox and SDL use X11
+  instead of a host Wayland session.
 - **Lifetime**: a session lives exactly as long as its `tg`. Whichever of COMMAND, the xpra client or the server ends
   first, `tg` stops the rest, restores the terminal, and removes the session directory. The directory is kept, and
   its path printed, if something failed or `-v` was given. COMMAND counts as running while any process in its process
@@ -155,11 +158,14 @@ Logs in the session directory:
 - **Detach ends the program.** There is no reattach. Closing the kitty window ends the session too.
 - **Programs that hand off to a running instance** (Firefox, Chromium, some Electron apps) open on the host desktop.
   Use their new-instance or profile flags.
-- **Programs that daemonize themselves** look as if they exited, and `tg` ends the session.
+- **Programs that daemonize themselves** look as if they exited, and `tg` ends the session. A program that keeps
+  running without a window is a problem in seamless mode, see below.
 - **Host shortcuts** such as Alt+Tab never reach the session. GNOME hosts may intercept some Alt+Shift combinations.
 - **No scaling**: the desktop is drawn 1:1 at 96 DPI. On HiDPI screens set `GDK_SCALE` or `QT_SCALE_FACTOR`; `tg`
   passes them through.
-- **Seamless mode** crops windows larger than the terminal and cannot reach covered windows.
+- **Seamless mode** crops windows larger than the terminal and cannot reach covered windows. Keyboard input,
+  including the Alt+Shift+F4 detach key, only works while the program has a mapped window. With no window the session
+  can only be ended by closing the kitty window or sending SIGTERM to `tg` from another shell.
 - **Performance**: kitty's rendering is the bottleneck for large animated windows. Over ssh, or without a shared
   `/dev/shm`, frames are sent as base64. A small `/dev/shm` can fill up under load. `XPRA_TERMINAL_SHM=0` avoids shared
   memory, but the first frame may then stay black for a long time. On a heavily loaded machine (load average 90) a
@@ -177,8 +183,9 @@ Logs in the session directory:
 ## Development
 
 ```
-flake.nix, flake.lock       packages (tg, xpra), apps, checks, devShell
+flake.nix, flake.lock       packages (tg, xpra, matchbox), apps, checks, devShell
 nix/xpra.nix                nixpkgs' xpra, built from the pinned xpra-src input, no patches
+nix/matchbox.nix            nixpkgs' matchbox, patched to ignore NumLock/CapsLock in its key bindings
 nix/tg.nix                  installs src/tg.py with store paths substituted (no wrapper)
 src/tg.py                   the whole program, Python 3 standard library only
 src/share/matchbox-kbdconfig
@@ -191,9 +198,14 @@ tests/kitty/                end-to-end test in a real kitty on an X display
 ```sh
 nix develop                                  # xpra, ruff, xdotool, imagemagick, xterm, xrandr, xwininfo
 nix flake check                              # unit tests, CLI checks, ruff
-TG=$(tests/dev-link.sh) tests/fakekitty/run.sh
-TG=$(tests/dev-link.sh) tests/kitty/e2e.sh   # needs an X display (KH_DISPLAY, default :175)
+TG=$(tests/dev-link.sh) tests/fakekitty/run.sh  # scratch dir: TG_SMOKE_DIR (default /tmp/tg-smoke-$UID)
+TG=$(tests/dev-link.sh) KH_DISPLAY=:N tests/kitty/e2e.sh  # scratch dir: TG_E2E_DIR (default /tmp/tg-e2e-$UID)
 ```
+
+`tests/kitty/e2e.sh` needs a dedicated X display (an Xvfb, say) in `KH_DISPLAY`, never your desktop: it injects
+XTEST input there. The test scripts wipe their scratch directories and kill the processes that mention them, so they
+never use `TG_RUNTIME_DIR`. Flakes only see git-tracked files: `git add` new test files before `nix flake check`, or
+run `python3 -m unittest discover -s tests/unit` directly against the working tree.
 
 The three test tiers:
 
@@ -206,8 +218,8 @@ The three test tiers:
    resize, the pointer, window switching, shortcuts and detach, app exit, a client crash, hangup, two concurrent
    sessions, and popup menus in a GTK program. Screenshots go to `tests/kitty/out/`.
 
-Pinned revisions: nixpkgs `f20cd90e28fe0403873f473b29e42662cd86e8c4`, xpra
-`92be3fe67c0f7f486c9be6a16b673ccd423d3caa` (8.0 master). To update:
+The nixpkgs and xpra revisions are pinned in flake.lock (`nix flake metadata` shows them; xpra is a master commit,
+currently in the 8.0 series). To update:
 
 ```sh
 nix flake update xpra-src                    # current master, or pin a revision:

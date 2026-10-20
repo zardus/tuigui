@@ -6,6 +6,8 @@
   # fix-122159.patch applies only with fuzz and concerns systemd-run, which tg disables.
   # Set explicitly so a nixpkgs bump cannot inject patches that no longer apply.
   patches = [ ];
-  doInstallCheck = false; # installCheck was written for 6.5.x
-  passthru = (old.passthru or { }) // { inherit xpra-src; };
+  doInstallCheck = false; # the only installCheck content is udevCheckHook (udev rules verify), irrelevant for tg
+  # nix-update would bump the overridden version; the changelog link names 6.5.x
+  passthru = (removeAttrs (old.passthru or { }) [ "updateScript" ]) // { inherit xpra-src; };
+  meta = old.meta // { changelog = "https://github.com/Xpra-org/xpra/commits/${xpra-src.rev}"; };
 })
