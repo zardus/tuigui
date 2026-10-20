@@ -393,8 +393,9 @@ class SessionPids(unittest.TestCase):
 
     def test_matches(self):
         with tempfile.TemporaryDirectory() as R:
-            sleeper = ["/bin/sh", "-c", "sleep 30; :", "x"]       # '; :' keeps sh from exec'ing sleep
-            base = {"PATH": "/usr/bin:/bin"}
+            # the interpreter running the tests is the only program a Nix build sandbox is sure to have
+            sleeper = [sys.executable, "-I", "-c", "import time; time.sleep(30)"]
+            base = {}
             pager = self.spawn(sleeper + [R + "/tg.log"], {**base, "PWD": R})
             other = self.spawn(sleeper, {**base, "XDG_RUNTIME_DIR": R + "x"})
             ours = [self.spawn(sleeper, {**base, "XDG_RUNTIME_DIR": R}),
