@@ -291,8 +291,11 @@ step9() {
   round e -- "$XCLOCK" -update 1
   check "9: session started" wait_session e || return
   check "9: SIGHUP sent to tg" kill -HUP "$(cut -d" " -f1 "$R/tg.pid")"
-  check "9: SIGHUP to tg leaves nothing running within 10 s" gone "$RT/e/" 10
+  sleep 3
+  check "9: the session survives the hangup" test -d "$R"
   check "9: tty is cooked again" tty_cooked 9
+  kill "$(cut -d" " -f1 "$R/tg.pid")" 2>/dev/null       # the detached supervisor: SIGTERM ends the session
+  check "9: SIGTERM to the supervisor leaves nothing running within 10 s" gone "$RT/e/" 10
 }
 
 step10() {

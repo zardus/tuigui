@@ -127,11 +127,11 @@ kitty
   session directory, where the logs below are written) and variables that make GTK, Qt, Firefox and SDL use X11
   instead of a host Wayland session.
 - **Lifetime**: a session lives as long as COMMAND and its xpra server. When either ends, `tg` stops the other,
-  restores the terminal and removes the session directory; it also ends everything when the client fails or the
-  terminal hangs up. The directory is kept, and its path printed, if something failed or `-v` was given. COMMAND
+  restores the terminal and removes the session directory; it also ends everything when the client fails. The directory is kept, and its path printed, if something failed or `-v` was given. COMMAND
   counts as running while any process in its process group is alive, so `sh -c 'xclock & exit 0'` keeps the session
   until xclock exits.
-- **Detach** (Ctrl+Alt+Shift+D, or another `tg :N` taking the session over): `tg` restores the terminal, returns your
+- **Detach** (Ctrl+Alt+Shift+D, another `tg :N` taking the session over, or the terminal hanging up: a dropped ssh
+  connection or a closed window): `tg` restores the terminal, returns your
   prompt, and forks a background supervisor (recorded in the session's `tg.pid`) that keeps watching COMMAND and the
   server and cleans up as above. The server does not exit with its client (`--exit-with-client=no`). SIGTERM to the
   supervisor ends the session.

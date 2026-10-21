@@ -360,20 +360,32 @@ class FakeProc:
 class ExitClassification(unittest.TestCase):
     """Session.connection_ended: the client or the server went away; None means still running."""
 
-    def classify(self, client_rc, server_rc, sig=None, reason=None):
+    def classify(self, client_rc, server_rc, sig=None, reason=None, tty_gone=None):
         with tempfile.TemporaryDirectory() as R, mock.patch.object(tg, "wait_until", return_value=False), \
-                mock.patch.object(tg, "disconnect_reason", return_value=reason):
+                mock.patch.object(tg, "disconnect_reason", return_value=reason), \
+                mock.patch.object(tg, "tty_gone", return_value=bool(tty_gone)):
             S = tg.Session(R, {"seamless": False, "verbose": 0}, ["app"], {})
             self.addCleanup(os.close, S.rwake)
             self.addCleanup(os.close, S.wwake)
             S.client, S.server, S.sig = FakeProc(client_rc), FakeProc(server_rc), sig
+            if tty_gone is not None:
+                S.saved_tty = []
+            S.terminate_client = mock.Mock()
             S.detach = mock.Mock(return_value="detached")
             self.messages = S.messages
             return S.connection_ended()
 
     def test_group_signal_wins_over_the_dead_client(self):
-        self.assertEqual(self.classify(-signal.SIGHUP, None, signal.SIGHUP), 128 + signal.SIGHUP)
+        self.assertEqual(self.classify(-signal.SIGTERM, None, signal.SIGTERM), 128 + signal.SIGTERM)
         self.assertEqual(self.messages, [])
+
+    def test_hangup_detaches(self):
+        with mock.patch.object(tg.Session, "app_group_alive", return_value=True):
+            self.assertEqual(self.classify(-signal.SIGHUP, None, signal.SIGHUP), "detached")
+            self.assertEqual(self.classify(1, None, tty_gone=True), "detached")    # SIGHUP not yet handled
+            self.assertEqual(self.classify(1, None), 4)                            # a live terminal: a failure
+        self.assertEqual(self.classify(-signal.SIGHUP, None, signal.SIGHUP), 128 + signal.SIGHUP)  # COMMAND gone
+        self.assertEqual(self.classify(-signal.SIGHUP, 0, signal.SIGHUP), 128 + signal.SIGHUP)     # server gone
 
     def test_detach_leaves_the_server_running(self):
         self.assertEqual(self.classify(0, None), "detached")

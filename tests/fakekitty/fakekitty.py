@@ -10,6 +10,7 @@ env: DUR=SECS            SIGTERM the command (SIGKILL its process group 10 s lat
      RESIZE=C,R,X,Y@SECS after SECS seconds set the winsize to C columns, R rows, X by Y pixels and send SIGWINCH
      INPUT=BYTES@SECS    after SECS seconds type BYTES (backslash escapes allowed), e.g. kitty's Ctrl+Alt+Shift+D
                          press and release: '\\x1b[100:68;8u\\x1b[100:68;8:3u@10'
+     HANGUP=SECS         after SECS seconds close the pty, as a dropped ssh connection or a closed window does
 """
 import codecs
 import fcntl
@@ -87,6 +88,7 @@ def main(argv):
     duration = float(os.environ.get("DUR", "15"))
     resize = parse_resize(os.environ["RESIZE"]) if os.environ.get("RESIZE") else None
     typed = parse_input(os.environ["INPUT"]) if os.environ.get("INPUT") else None
+    hangup = float(os.environ["HANGUP"]) if os.environ.get("HANGUP") else None
 
     pid, fd = pty.fork()
     if pid == 0:
@@ -116,6 +118,11 @@ def main(argv):
                 os.write(fd, typed[0])
                 print(f"fakekitty: t={now:.1f}s typed {typed[0]!r}", file=sys.stderr)
                 typed = None
+            if hangup is not None and now >= hangup:
+                os.close(fd)          # the kernel sends SIGHUP to the session leader and the foreground group
+                print(f"fakekitty: t={now:.1f}s hung up", file=sys.stderr)
+                hangup = fd = None
+                eof = True
             if stop_sent is None and now >= duration:
                 print(f"fakekitty: t={now:.1f}s DUR reached, sending SIGTERM", file=sys.stderr)
                 os.kill(pid, signal.SIGTERM)
@@ -140,14 +147,15 @@ def main(argv):
             if done:
                 status = st
         # what the command wrote just before exiting is still buffered in the pty
-        while not eof and select.select([fd], [], [], 0.2)[0]:
+        while fd is not None and not eof and select.select([fd], [], [], 0.2)[0]:
             try:
                 data = os.read(fd, 65536)
             except OSError:
                 break
             eof = not data
             out.write(data)
-    os.close(fd)
+    if fd is not None:
+        os.close(fd)
     sys.exit(exit_code(status))
 
 

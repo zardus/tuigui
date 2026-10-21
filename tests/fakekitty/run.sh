@@ -327,6 +327,27 @@ test10() {
   no_leftovers t10 "$dpy"
 }
 
+test12() {
+  local rt=$BASE/t12 out=$BASE/t12.bin R rc dpy
+  mkdir -m 700 "$rt"
+  DUR=60 HANGUP=$((RESIZE_AT + 12)) fk "$out" env TG_RUNTIME_DIR="$rt" "$TG" -- "$XTERM" &
+  local fkpid=$!
+  if ! R=$(session_dir "$rt" 90); then fail "t12: session became ready"; wait "$fkpid"; return; fi
+  dpy=$(display_of "$R")
+  wait "$fkpid"; rc=$?
+  check "t12: tg exits $rc == 0 when the terminal hangs up" test "$rc" = 0
+  check "t12: a supervisor owns the session" python3 -I -c '
+import sys; sys.path.insert(0, sys.argv[2]); import tg; sys.exit(not tg.session_alive(sys.argv[1]))' "$R" "$REPO/src"
+  check "t12: xterm still runs" test -n "$(procs "$XTERM")"
+  check "t12: bare tg lists the session" session_listed "$rt" "$dpy" xterm
+  out=$BASE/t12b.bin
+  DUR=60 INPUT="$QUIT_KEY@10" fk "$out" env TG_RUNTIME_DIR="$rt" "$TG" "$dpy"; rc=$?
+  check "t12: reattached tg exits $rc == 0 after Ctrl+Alt+Shift+Q" test "$rc" = 0
+  check "t12: the reattached client drew frames" frames "$out"
+  check "t12: the supervisor removed the session dir" wait_gone "$R" 30
+  no_leftovers t12 "$dpy"
+}
+
 # x11 R PROGRAM ARGS...: run an X client against session R's display
 x11() { local R=$1; shift; DISPLAY=$(display_of "$R") XAUTHORITY=$R/Xauthority "$@"; }
 
@@ -460,7 +481,7 @@ main() {
   SHM_BEFORE=$(shm_objects)
   trap cleanup EXIT
   local tests=("$@") t
-  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8 9 10 11)
+  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8 9 10 11 12)
   for t in "${tests[@]}"; do echo "== test $t"; "test$t"; done
   echo "== $PASSES passed, $FAILS failed (outputs in $BASE)"
   ((FAILS == 0))

@@ -68,8 +68,9 @@ tg starts a private X server and xpra session, runs COMMAND in it and shows
 it in this terminal through the kitty graphics protocol. The program fills
 the terminal and follows its size. tg exits when COMMAND exits, when you
 quit with Ctrl+Alt+Shift+Q (which ends COMMAND), or when you detach with
-Ctrl+Alt+Shift+D: COMMAND then keeps running in the background. In seamless
-mode the keys only work while COMMAND has a window.
+Ctrl+Alt+Shift+D: COMMAND then keeps running in the background, as it does
+when the terminal hangs up (ssh drops, the window closes). In seamless mode
+the keys only work while COMMAND has a window.
 
 Without arguments, tg lists your detached tg sessions and the other xpra
 servers you can attach to (in $XDG_RUNTIME_DIR/xpra, /run/xpra and ~/.xpra).
@@ -105,6 +106,15 @@ Does not work inside tmux, screen or zellij."""
 
 class Usage(Exception):
     """A usage or environment problem: args are (cause, action); exit status 2."""
+
+
+def tty_gone(fd=0):
+    """Whether fd's terminal was hung up (or never was one)."""
+    try:
+        termios.tcgetattr(fd)
+        return False
+    except (OSError, termios.error):
+        return True
 
 
 def err(cause, action=None):
@@ -767,6 +777,8 @@ class Session:
 
     def supervise(self):
         while True:
+            if self.sig == signal.SIGHUP:
+                return self.hung_up()
             if self.sig:
                 self.note(f"signal {self.sig}")
                 return 128 + self.sig
@@ -790,6 +802,8 @@ class Session:
 
     def connection_ended(self):
         """The client or the server went away: decides which one ended the session."""
+        if self.sig == signal.SIGHUP or (self.client.poll() not in (None, 0) and self.saved_tty is not None and tty_gone()):
+            return self.hung_up()
         if self.sig:            # a group-wide signal (window closed, kill -- -pgid) took the client with us
             self.note(f"signal {self.sig}")
             return 128 + self.sig
@@ -809,6 +823,17 @@ class Session:
         # the server outlives its client (--exit-with-client=no): Ctrl+Alt+Shift+D, or another client took over
         return self.detach()
 
+    def hung_up(self):
+        """The terminal went away (ssh dropped, window closed): detaches, unless the session is already ending."""
+        self.note(f"terminal hung up (signal {self.sig})")
+        self.sig = None
+        self.terminate_client()
+        if self.server.poll() is not None or not self.app_group_alive():
+            self.note(f"server {'gone' if self.server.poll() is not None else 'up'}, app group "
+                      f"{'alive' if self.app_group_alive() else 'gone'}: not detaching")
+            return 128 + signal.SIGHUP
+        return self.detach()
+
     def detach(self):
         """Gives the terminal back and goes on supervising COMMAND and the server from the background, so that
         the session ends (and R goes) when COMMAND exits or the server is stopped. Returns in the child only."""
@@ -817,7 +842,10 @@ class Session:
         self.note("detached")
         err(f"detached; {os.path.basename(self.cmd[0])} keeps running on {self.display}.",
             f"run tg {self.display} to attach again (tg alone lists sessions).")
-        sys.stderr.flush()
+        try:
+            sys.stderr.flush()
+        except OSError:                                          # the terminal is gone (hangup)
+            pass
         server, app = Adopted(self.server), Adopted(self.app)    # before the fork: start times while still ours
         r, w = os.pipe()
         if os.fork():
