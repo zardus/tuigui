@@ -5,14 +5,16 @@
 #   TG              tg to test, e.g. the dev-linked one from tests/dev-link.sh (required)
 #   TG_SMOKE_DIR    scratch parent, wiped at start; must be short (AF_UNIX) (default /tmp/tg-smoke-$UID).
 #                   Not TG_RUNTIME_DIR: the suite deletes it and kills every process that mentions it.
-#   TEST            any of 1 2 3 4 5 6 7 8 9 (default: all)
+#   TEST            any of 1 2 3 4 5 6 7 8 9 10 (default: all)
 #   RESIZE_AT       seconds after start when the fake terminal shrinks (default 8; raise it on a loaded host)
 #
 # Tests: 1 desktop/xdummy size, resize, exit status, frames, logs   2 client killed -> exit 4
 #        3 SIGTERM / SIGKILL to tg, then --gc                           4 seamless and xvfb variants of 1
 #        5 refusals start nothing                                     6 quick-exit hint
-#        7 Alt+Shift+F4 detach -> 0, dir removed                          8 client fails at startup -> 4, promptly
-#        9 tg lists a plain xpra server, tg :N attaches, detach leaves it running
+#        7 Ctrl+Alt+Shift+D detaches, tg lists the session, tg :N reattaches, Ctrl+Alt+Shift+Q ends it
+#        8 client fails at startup -> 4, promptly
+#        9 tg lists a plain xpra server, tg :N attaches, detach leaves it running, quit stops it
+#       10 tg :N from another terminal takes a session over: the first tg detaches
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -198,8 +200,8 @@ test3() {
   TG_RUNTIME_DIR=$rt "$TG" --gc </dev/null | sed 's/^/     /'
   check "t3: --gc removed the session dir" test ! -e "$R"
 
-  # SIGKILL: tg cannot clean up; the client gets the hangup when the terminal goes away, the server follows it
-  # (--exit-with-client), and --gc removes what is left
+  # SIGKILL: tg cannot clean up; the client gets the hangup when the terminal goes away, the server and COMMAND
+  # keep running (--exit-with-client=no), and --gc stops and removes them
   DUR=40 fk "$out" env TG_RUNTIME_DIR="$rt" "$TG" -- "$XCLOCK" -update 1 &
   fkpid=$!
   if ! R=$(session_dir "$rt" 90); then fail "t3k: session became ready"; wait "$fkpid"; return; fi
@@ -266,23 +268,63 @@ test6() {
   no_leftovers t6
 }
 
-# kitty's encoding (keyboard protocol flags 31) of Alt+Shift+F4 press and release
-DETACH_KEY='\x1b[1;4S\x1b[1;4:3S'
+# kitty's encoding (keyboard protocol flags 31) of Ctrl+Alt+Shift+D and Ctrl+Alt+Shift+Q, press and release:
+# key code:shifted key ; modifiers 1+shift+alt+ctrl (:3 = release)
+DETACH_KEY='\x1b[100:68;8u\x1b[100:68;8:3u'
+QUIT_KEY='\x1b[113:81;8u\x1b[113:81;8:3u'
+
+# session_listed BASE DISPLAY NAME: bare tg lists DISPLAY with NAME
+session_listed() { TG_RUNTIME_DIR=$1 "$TG" 2>/dev/null | grep -qE "^$2 .* $3\$"; }
+
+# wait_gone PATH TIMEOUT
+wait_gone() { local end=$((SECONDS + $2)); while [[ -e $1 ]] && ((SECONDS < end)); do sleep 0.2; done; [[ ! -e $1 ]]; }
 
 test7() {
-  local rt=$BASE/t7 out=$BASE/t7.bin R rc
+  local rt=$BASE/t7 out=$BASE/t7.bin R rc dpy
   mkdir -m 700 "$rt"
   DUR=60 INPUT="$DETACH_KEY@$((RESIZE_AT + 12))" fk "$out" env TG_RUNTIME_DIR="$rt" "$TG" -- "$XTERM" &
   local fkpid=$!
   if ! R=$(session_dir "$rt" 90); then fail "t7: session became ready"; wait "$fkpid"; return; fi
+  dpy=$(display_of "$R")
   wait "$fkpid"; rc=$?
-  check "t7: tg exit status $rc == 0 after Alt+Shift+F4" test "$rc" = 0
+  check "t7: tg exit status $rc == 0 after Ctrl+Alt+Shift+D" test "$rc" = 0
   check "t7: alternate screen left, keyboard flags popped" has_seq "$out" $'\e[?1049l' $'\e[<u'
-  check "t7: session dir removed" test ! -e "$R"
-  no_leftovers t7
+  check "t7: says it detached" has_seq "$out" "detached; xterm keeps running on $dpy"
+  check "t7: the session dir stays" test -d "$R"
+  check "t7: a supervisor owns the session" python3 -I -c '
+import sys; sys.path.insert(0, sys.argv[2]); import tg; sys.exit(not tg.session_alive(sys.argv[1]))' "$R" "$REPO/src"
+  check "t7: xterm still runs" test -n "$(procs "$XTERM")"
+  check "t7: bare tg lists the session" session_listed "$rt" "$dpy" xterm
+
+  out=$BASE/t7b.bin
+  DUR=60 INPUT="$QUIT_KEY@10" fk "$out" env TG_RUNTIME_DIR="$rt" "$TG" "$dpy"; rc=$?
+  check "t7: reattached tg exits $rc == 0 after Ctrl+Alt+Shift+Q" test "$rc" = 0
+  check "t7: the reattached client drew frames" frames "$out"
+  check "t7: says the session was shut down" has_seq "$out" "disconnected: server shutdown"
+  check "t7: the supervisor removed the session dir" wait_gone "$R" 15
+  no_leftovers t7 "$dpy"
 }
 
-# a client that exits before its hello: the server gets no exit-with-client, tg must stop it with `xpra stop`
+test10() {
+  local rt=$BASE/t10 out=$BASE/t10.bin out2=$BASE/t10b.bin R rc dpy
+  mkdir -m 700 "$rt"
+  DUR=90 fk "$out" env TG_RUNTIME_DIR="$rt" "$TG" -- "$XTERM" &
+  local fkpid=$!
+  if ! R=$(session_dir "$rt" 90); then fail "t10: session became ready"; wait "$fkpid"; return; fi
+  dpy=$(display_of "$R")
+  sleep 3
+  DUR=60 INPUT="$QUIT_KEY@10" fk "$out2" env TG_RUNTIME_DIR="$rt" "$TG" "$dpy"; rc=$?
+  check "t10: the taking-over tg exits $rc == 0 after Ctrl+Alt+Shift+Q" test "$rc" = 0
+  check "t10: it drew frames" frames "$out2"
+  wait "$fkpid"; rc=$?
+  check "t10: the first tg exits $rc == 0 when taken over" test "$rc" = 0
+  check "t10: the first tg says it detached" has_seq "$out" "detached; xterm keeps running on $dpy"
+  check "t10: the first tg left the alternate screen" has_seq "$out" $'\e[?1049l'
+  check "t10: the supervisor removed the session dir" wait_gone "$R" 15
+  no_leftovers t10 "$dpy"
+}
+
+# a client that exits before its hello: tg must stop the server with `xpra stop`, promptly
 test8() {
   local rt=$BASE/t8 out=$BASE/t8.bin rc t0 tc R
   mkdir -m 700 "$rt"
@@ -329,7 +371,7 @@ test9() {
   check "t9: the listing names the session" has_seq <(XDG_RUNTIME_DIR=$xr "$TG" 2>&1) t9clock
 
   DUR=40 INPUT="$DETACH_KEY@10" fk "$out" env XDG_RUNTIME_DIR="$xr" TG_RUNTIME_DIR="$rt" "$TG" "$dpy"; rc=$?
-  check "t9: tg exit status $rc == 0 after Alt+Shift+F4" test "$rc" = 0
+  check "t9: tg exit status $rc == 0 after Ctrl+Alt+Shift+D" test "$rc" = 0
   check "t9: alternate screen left, keyboard flags popped" has_seq "$out" $'\e[?1049l' $'\e[<u'
   check "t9: an inline frame decodes" frames "$out"
   check "t9: says the server is still running" has_seq "$out" "still running"
@@ -337,16 +379,12 @@ test9() {
   check "t9: session dir removed" test -z "$(find "$rt" -mindepth 1 -maxdepth 1 -type d)"
 
   out=$BASE/t9b.bin
-  DUR=40 fk "$out" env XDG_RUNTIME_DIR="$xr" TG_RUNTIME_DIR="$rt" "$TG" "$dpy" &
-  local fkpid=$!
-  sleep 10
-  XDG_RUNTIME_DIR=$xr XPRA_USER_CONF_DIRS=$xr/cfg "$XPRA" stop "socket://$(compgen -G "$xr/xpra/*-${dpy#:}")" \
-    >/dev/null 2>&1
-  wait "$fkpid"; rc=$?
-  info "t9: tg exit status $rc after the server was stopped under it"
+  DUR=40 INPUT="$QUIT_KEY@10" fk "$out" env XDG_RUNTIME_DIR="$xr" TG_RUNTIME_DIR="$rt" "$TG" "$dpy"; rc=$?
+  check "t9: tg exit status $rc == 0 after Ctrl+Alt+Shift+Q" test "$rc" = 0
   check "t9: alternate screen left after the server went away" has_seq "$out" $'\e[?1049l'
   check "t9: no 'still running' claim" test -z "$(grep -aF "still running" "$out")"
   check "t9: says the server shut down" has_seq "$out" "disconnected: server shutdown"
+  check "t9: the server exited" wait_gone "/proc/$spid" 15
   wait "$spid"
   no_leftovers t9 "$dpy"
 }
@@ -366,7 +404,7 @@ main() {
   SHM_BEFORE=$(shm_objects)
   trap cleanup EXIT
   local tests=("$@") t
-  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8 9)
+  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8 9 10)
   for t in "${tests[@]}"; do echo "== test $t"; "test$t"; done
   echo "== $PASSES passed, $FAILS failed (outputs in $BASE)"
   ((FAILS == 0))

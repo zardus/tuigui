@@ -8,8 +8,8 @@ memory (t=s), which is refused so frames travel inline and can be decoded from O
 
 env: DUR=SECS            SIGTERM the command (SIGKILL its process group 10 s later) when it runs longer than this (15)
      RESIZE=C,R,X,Y@SECS after SECS seconds set the winsize to C columns, R rows, X by Y pixels and send SIGWINCH
-     INPUT=BYTES@SECS    after SECS seconds type BYTES (backslash escapes allowed), e.g. kitty's Alt+Shift+F4
-                         press and release: '\\x1b[1;4S\\x1b[1;4:3S@10'
+     INPUT=BYTES@SECS    after SECS seconds type BYTES (backslash escapes allowed), e.g. kitty's Ctrl+Alt+Shift+D
+                         press and release: '\\x1b[100:68;8u\\x1b[100:68;8:3u@10'
 """
 import codecs
 import fcntl

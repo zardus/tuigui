@@ -35,7 +35,11 @@ QUIET = ["--mdns=no", "--dbus-launch=no", "--dbus=no", "--dbus-control=no", "--n
          "--xsettings=no", "--bell=no"]
 CLIENT_QUIET = ["--speaker=no", "--microphone=no", "--audio=no", "--webcam=no", "--notifications=no",
                 "--printing=no", "--file-transfer=no", "--open-files=no", "--open-url=no", "--tray=no", "--mdns=no"]
-SHORTCUTS = ["--shortcut-modifiers=meta+shift", "--key-shortcut=clear", "--key-shortcut=#+F4:quit"]
+# Ctrl+Alt+Shift (the terminal client calls Alt "meta"): D detaches, Q asks the server to shut down. Both cases of the
+# letter, since shift is held. Not F-keys: Alt+Fn and Ctrl+Alt+Fn switch virtual consoles, Alt+F4 closes windows.
+SHORTCUTS = ["--shortcut-modifiers=control+meta+shift", "--key-shortcut=clear",
+             "--key-shortcut=#+d:quit", "--key-shortcut=#+D:quit",
+             '--key-shortcut=#+q:send("shutdown-server")', '--key-shortcut=#+Q:send("shutdown-server")']
 X11_ENV = {"GDK_BACKEND": "x11", "QT_QPA_PLATFORM": "xcb", "MOZ_ENABLE_WAYLAND": "0",
            "SDL_VIDEODRIVER": "x11", "XDG_SESSION_TYPE": "x11"}
 XPRA_SCRUB = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XPRA_CONF_DIR")
@@ -60,15 +64,15 @@ usage: tg [-s] [-v] [--] COMMAND [ARGS...]
 
 tg starts a private X server and xpra session, runs COMMAND in it and shows
 it in this terminal through the kitty graphics protocol. The program fills
-the terminal and follows its size. tg exits when COMMAND exits, or when you
-press Alt+Shift+F4 to detach, which also ends COMMAND (in seamless mode only
-while COMMAND has a window).
+the terminal and follows its size. tg exits when COMMAND exits, when you
+quit with Ctrl+Alt+Shift+Q (which ends COMMAND), or when you detach with
+Ctrl+Alt+Shift+D: COMMAND then keeps running in the background. In seamless
+mode the keys only work while COMMAND has a window.
 
-Without arguments, tg lists the running xpra servers you can attach to (in
-$XDG_RUNTIME_DIR/xpra, /run/xpra and ~/.xpra). tg's own sessions are not
-listed: their client is already attached. tg :DISPLAY attaches to one of them
-in this terminal; Alt+Shift+F4 detaches and leaves it running. A client that
-is already attached to it is disconnected.
+Without arguments, tg lists your detached tg sessions and the other xpra
+servers you can attach to (in $XDG_RUNTIME_DIR/xpra, /run/xpra and ~/.xpra).
+tg :DISPLAY attaches to one of them in this terminal, disconnecting any
+client already attached to it.
 
 options:
   -s, --seamless   draw each X window where it is instead of one fitted desktop
@@ -78,7 +82,8 @@ options:
       --gc         clean up sessions whose tg process is gone
 
 keys inside the session:
-  Alt+Shift+F4             detach and quit (tg :DISPLAY: detach only)
+  Ctrl+Alt+Shift+D         detach: COMMAND keeps running, tg :DISPLAY reattaches
+  Ctrl+Alt+Shift+Q         quit: end COMMAND and its X session
   Alt+Shift+n / Alt+Shift+p  next / previous window (dialogs, extra windows)
   everything else, including Ctrl+C, goes to the program
 
@@ -229,7 +234,7 @@ def app_env(env, R, display):
     return e
 
 
-def build_server_cmd(opts, R, w_fd, size, xserver, extra):
+def build_server_cmd(opts, R, w_fd, size, xserver, extra, name=None):
     sub = "start" if opts["seamless"] else "start-desktop"
     q = shlex.quote                            # xpra shlex-splits --xvfb and --start-late
     xa = q(os.path.join(R, "Xauthority"))
@@ -242,8 +247,8 @@ def build_server_cmd(opts, R, w_fd, size, xserver, extra):
                 f"-configdir {q(R + '/xorg.conf.d')} -config {q(XPRA_PREFIX + '/etc/xpra/xorg.conf')}")
     cmd = [XPRA, sub, "--daemon=no", f"--displayfd={w_fd}",
            f"--bind={R}/x.sock", f"--socket-dirs={R}", f"--socket-dir={R}", f"--sessions-dir={R}/s",
-           f"--log-dir={R}", "--exit-with-client=yes", "--exit-with-children=no", "--start-new-commands=no",
-           "--server-idle-timeout=300", f"--xvfb={xvfb}"]
+           f"--log-dir={R}", "--exit-with-client=no", "--exit-with-children=no", "--start-new-commands=no",
+           f"--xvfb={xvfb}"]
     if not opts["seamless"]:
         # initial resolutions are a dummy-driver feature; Xvfb starts at its -screen size and is re-fitted
         rd = "yes" if (size is None or xserver == "xvfb") else f"yes:{size[0]}x{size[1]}"
@@ -252,12 +257,14 @@ def build_server_cmd(opts, R, w_fd, size, xserver, extra):
         cmd += [f"--resize-display={rd}",
                 (f"--start-late={q(MATCHBOX)} -use_titlebar no -use_cursor yes "
                  f"-kbdconfig {q(SHARE + '/matchbox-kbdconfig')}")]
+    if name:
+        cmd.append(f"--session-name={name}")             # what the listing shows
     return cmd + QUIET + extra
 
 
 def build_client_cmd(opts, sock, extra):
-    # --reconnect=no: a lost connection means the server is gone (--exit-with-client), so a re-exec'd client
-    # would only print another banner on the restored tty
+    # --reconnect=no: a lost connection means the server is gone or another client took over, so a re-exec'd
+    # client would only print another banner on the restored tty
     cmd = ([XPRA, "attach", sock, "--backend=terminal", "--reconnect=no"]
            + CLIENT_QUIET + SHORTCUTS)
     if opts["verbose"] >= 2:
@@ -519,6 +526,25 @@ def make_runtime_dir(env):
 
 # ---------- the session ----------
 
+class Adopted:
+    """The parts of Popen that Session uses, for a process that is no longer our child (after detach() forked):
+    alive while its start time matches; its exit status is lost (0)."""
+
+    def __init__(self, proc):
+        self.pid, self.args = proc.pid, proc.args
+        self.start = proc_start(proc.pid)
+        self.returncode = proc.returncode
+
+    def poll(self):
+        if self.returncode is None and (self.start is None or proc_start(self.pid) != self.start):
+            self.returncode = 0
+        return self.returncode
+
+    def wait(self):
+        wait_until(lambda: self.poll() is not None, 10)
+        return self.returncode
+
+
 class Session:
     def __init__(self, R, opts, cmd, env, server_extra=(), client_extra=()):
         self.R, self.opts, self.cmd, self.env = R, opts, cmd, env
@@ -567,7 +593,8 @@ class Session:
 
     def start_server(self, size):
         r, w = os.pipe()
-        cmd = build_server_cmd(self.opts, self.R, w, size, self.env.get("TG_XSERVER", "xdummy"), self.server_extra)
+        cmd = build_server_cmd(self.opts, self.R, w, size, self.env.get("TG_XSERVER", "xdummy"), self.server_extra,
+                               os.path.basename(self.cmd[0]))
         self.note("server: " + shlex.join(cmd))
         with open(os.path.join(self.R, "server.log"), "ab") as serverlog:
             self.server = subprocess.Popen(cmd, env=xpra_env(self.env, self.R, True), start_new_session=True,
@@ -714,8 +741,8 @@ class Session:
             if self.client.poll() is not None or self.server.poll() is not None:
                 return self.connection_ended()
             if not self.app_group_alive():
-                # A detach or a client crash stops the server and X (--exit-with-client), and COMMAND usually dies
-                # of its closed X connection before the client process is gone: that is not COMMAND's own exit.
+                # Ctrl+Alt+Shift+Q stops the server and X, and COMMAND usually dies of its closed X connection
+                # before the client process is gone: that is not COMMAND's own exit.
                 t0 = time.monotonic()
                 if wait_until(self.x_session_ending, CASCADE_GRACE):
                     self.note(f"app group gone, X session ending after {time.monotonic() - t0:.2f} s")
@@ -735,13 +762,59 @@ class Session:
             self.note(f"signal {self.sig}")
             return 128 + self.sig
         wait_until(lambda: self.client.poll() is not None, 5)          # the client follows a dying server
+        reason = disconnect_reason(newest(os.path.join(self.R, "xpra", "xpra-terminal-*.log")))
+        if reason == "server shutdown":                               # Ctrl+Alt+Shift+Q, or `xpra stop`
+            wait_until(lambda: self.server.poll() is not None, 5)
         crc, src = self.client.poll(), self.server.poll()
         self.note(f"client {'alive' if crc is None else f'exited {crc}'}, "
-                  f"server {'alive' if src is None else f'exited {src}'}")
+                  f"server {'alive' if src is None else f'exited {src}'}, disconnect reason {reason!r}")
         if crc is None or src not in (None, 0):
             return self.server_died()
-        # the server exits 0 by itself once its client is gone (--exit-with-client)
-        return 0 if crc == 0 else self.client_failed()
+        if crc != 0 and reason != "new client":
+            return self.client_failed()
+        if src == 0:
+            return 0
+        # the server outlives its client (--exit-with-client=no): Ctrl+Alt+Shift+D, or another client took over
+        return self.detach()
+
+    def detach(self):
+        """Gives the terminal back and goes on supervising COMMAND and the server from the background, so that
+        the session ends (and R goes) when COMMAND exits or the server is stopped. Returns in the child only."""
+        self.restore_tty()
+        self.saved_tty = None
+        self.note("detached")
+        err(f"detached; {os.path.basename(self.cmd[0])} keeps running on {self.display}.",
+            f"run tg {self.display} to attach again (tg alone lists sessions).")
+        sys.stderr.flush()
+        server, app = Adopted(self.server), Adopted(self.app)    # before the fork: start times while still ours
+        r, w = os.pipe()
+        if os.fork():
+            os.close(w)
+            select.select([r], [], [], 5)                        # until the child owns tg.pid, for --gc
+            os._exit(0)
+        os.close(r)
+        os.setsid()
+        with open(os.path.join(self.R, "tg.pid"), "w") as f:
+            f.write(f"{os.getpid()} {proc_start(os.getpid()).decode()}\n")
+        os.write(w, b"x")
+        os.close(w)
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        os.close(null)
+        self.server, self.app, self.client = server, app, None
+        self.note(f"supervising from pid {os.getpid()}")
+        while True:
+            if self.sig:
+                self.note(f"signal {self.sig}")
+                return 128 + self.sig
+            if self.server.poll() is not None:
+                self.note("server gone")
+                return 0
+            if not self.app_group_alive():
+                self.note("app group gone")
+                return 0
+            self.wait(0.5)
 
     def app_finished(self):
         code = exit_status(self.app.returncode)
@@ -811,10 +884,9 @@ class Session:
 
     def stop_server(self):
         if self.server and self.server.poll() is None:
-            # An attached client's exit usually makes the server terminate by itself (--exit-with-client); a client
-            # that never completed its hello does not. `xpra stop` can hang on a closing socket (bounded by the
-            # timeout), and before readiness the socket may not answer at all.
-            if self.ready and not wait_until(lambda: self.server.poll() is not None, 1 if self.client else 0):
+            # The server outlives its clients (--exit-with-client=no) unless Ctrl+Alt+Shift+Q stopped it. `xpra stop`
+            # can hang on a closing socket (bounded by the timeout), and before readiness the socket may not answer.
+            if self.ready and self.server.poll() is None:
                 self.note("teardown: xpra stop")
                 try:
                     subprocess.run([XPRA, "stop", self.sock], env=xpra_env(self.env, self.R, True), timeout=3,
@@ -958,9 +1030,31 @@ def socket_listening(path):
             return False
 
 
+def tg_sockets(env, uid):
+    """The server sockets of tg sessions whose tg still runs (attached, or supervising a detached session)."""
+    out = []
+    for base in runtime_bases(env, uid):
+        try:
+            if base_problem(os.lstat(base), uid):
+                continue
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(base, name, "x.sock")
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if stat.S_ISSOCK(st.st_mode) and st.st_uid == uid and session_alive(os.path.join(base, name)):
+                out.append(path)
+    return out
+
+
 def probe_servers(env):
     """[(`xpra id` info, socket path)] of the servers that answer, once each (a server may have several sockets)."""
-    sockets = [s for s in find_sockets(xpra_socket_dirs(env, os.path.expanduser("~")), os.getuid())
+    uid = os.getuid()
+    sockets = [s for s in tg_sockets(env, uid) + find_sockets(xpra_socket_dirs(env, os.path.expanduser("~")), uid)
                if socket_listening(s)]
     servers, seen = [], set()
     if sockets:
@@ -991,7 +1085,7 @@ def probe_servers(env):
 def list_servers(env):
     servers = [info for info, _ in probe_servers(env)]
     if not servers:
-        err("no running xpra servers found.", "to start a program: tg COMMAND (see tg --help)")
+        err("no tg sessions or xpra servers found.", "to start a program: tg COMMAND (see tg --help)")
         return 0
     for line in format_servers(servers):
         print(line)

@@ -26,7 +26,7 @@ the first install compiles it.
 tg firefox --new-instance -P tg   # options after COMMAND belong to COMMAND
 tg -- gimp image.png
 tg -s xterm                       # seamless mode, see below
-tg                                # list the xpra servers you can attach to
+tg                                # list detached sessions and other xpra servers
 tg :100                           # attach to one of them
 ```
 
@@ -34,7 +34,8 @@ Keys inside the session:
 
 | Key | Action |
 |---|---|
-| Alt+Shift+F4 | detach and quit (this also ends the program, except after `tg :N`) |
+| Ctrl+Alt+Shift+D | detach: the program keeps running, `tg :N` reattaches |
+| Ctrl+Alt+Shift+Q | quit: end the program and its X session |
 | Alt+Shift+n / Alt+Shift+p | next / previous window (dialogs, extra windows) |
 | everything else, including Ctrl+C | goes to the program |
 
@@ -59,15 +60,16 @@ tg --help | --version
 
 Options are recognised only before COMMAND. The first non-option word or `--` ends them.
 
-Without arguments, `tg` lists the running xpra servers you can attach to: those with a socket of yours in xpra's
-default socket directories (`$XDG_RUNTIME_DIR/xpra`, `/run/xpra`, `~/.xpra`) that answer `xpra id`. `tg`'s own
-sessions are not listed, because their client is already attached.
+Without arguments, `tg` lists what you can attach to: running `tg` sessions (attached or detached), and other xpra
+servers with a socket of yours in xpra's default socket directories (`$XDG_RUNTIME_DIR/xpra`, `/run/xpra`,
+`~/.xpra`) that answer `xpra id`.
 
-`tg :DISPLAY` attaches to one of those servers in the current kitty window, with the same client settings and keys
-as a session `tg` starts. Alt+Shift+F4 only detaches: the server and its programs keep running, and `tg` says so. A
-client already attached to that server is disconnected (xpra's default without `--sharing`). `-s` does not apply,
-and neither do the `TG_XSERVER`, `TG_TIMEOUT` and `TG_SERVER_ARGS` variables. Exit status: 0 after a detach or when
-the server shuts down, 2 if no server of yours answers on DISPLAY or it is too old, 4 if the client failed.
+`tg :DISPLAY` attaches to one of them in the current kitty window, with the same client settings and keys as a
+session `tg` starts. A client already attached is disconnected (xpra's default without `--sharing`); if that client
+belongs to a `tg` session, that `tg` detaches. Ctrl+Alt+Shift+D detaches again, Ctrl+Alt+Shift+Q shuts the server
+down (and with it a `tg` session's program). `-s` does not apply, and neither do the `TG_XSERVER`, `TG_TIMEOUT` and
+`TG_SERVER_ARGS` variables. Exit status: 0 after a detach or when the server shuts down, 2 if no server of yours
+answers on DISPLAY or it is too old, 4 if the client failed.
 
 `tg`'s client is the pinned xpra 8.0 build, which refuses servers older than xpra 7.0. Distributions and nixpkgs
 still ship xpra 6.x, so a server started with the system `xpra` cannot be attached to: the listing marks it
@@ -90,7 +92,7 @@ still ship xpra 6.x, so a server started with the system `xpra` cannot be attach
 | `TG_SERVER_ARGS`, `TG_CLIENT_ARGS` | empty | Extra xpra server / client arguments, appended last (the last value of an option wins). |
 | `XPRA_TERMINAL_*` | xpra defaults | Passed to the xpra client unchanged, e.g. `XPRA_TERMINAL_SHM=0`. |
 
-Exit status: COMMAND's own status (0 after a detach); 2 for usage or environment errors (not a tty, tmux, not kitty,
+Exit status: COMMAND's own status (0 after a detach or Ctrl+Alt+Shift+Q); 2 for usage or environment errors (not a tty, tmux, not kitty,
 command not found, runtime directory unusable); 3 if the xpra or X server failed; 4 if the xpra client failed;
 128+N if COMMAND or `tg` was killed by signal N.
 
@@ -121,10 +123,15 @@ kitty
   `WAYLAND_DISPLAY`, plus `DISPLAY`, `XAUTHORITY` (the session's Xauthority file), `TG_SESSION` (the path of the
   session directory, where the logs below are written) and variables that make GTK, Qt, Firefox and SDL use X11
   instead of a host Wayland session.
-- **Lifetime**: a session lives exactly as long as its `tg`. Whichever of COMMAND, the xpra client or the server ends
-  first, `tg` stops the rest, restores the terminal, and removes the session directory. The directory is kept, and
-  its path printed, if something failed or `-v` was given. COMMAND counts as running while any process in its process
-  group is alive, so `sh -c 'xclock & exit 0'` keeps the session until xclock exits.
+- **Lifetime**: a session lives as long as COMMAND and its xpra server. When either ends, `tg` stops the other,
+  restores the terminal and removes the session directory; it also ends everything when the client fails or the
+  terminal hangs up. The directory is kept, and its path printed, if something failed or `-v` was given. COMMAND
+  counts as running while any process in its process group is alive, so `sh -c 'xclock & exit 0'` keeps the session
+  until xclock exits.
+- **Detach** (Ctrl+Alt+Shift+D, or another `tg :N` taking the session over): `tg` restores the terminal, returns your
+  prompt, and forks a background supervisor (recorded in the session's `tg.pid`) that keeps watching COMMAND and the
+  server and cleans up as above. The server does not exit with its client (`--exit-with-client=no`). SIGTERM to the
+  supervisor ends the session.
 
 Logs in the session directory:
 
@@ -151,14 +158,14 @@ Logs in the session directory:
 
 - **A few xpra lines appear above the prompt** before the session starts and after it ends. This is xpra's banner and
   exit statistics. The "(press Control-C to detach)" line is wrong for `tg`: Ctrl+C goes to the program and
-  Alt+Shift+F4 detaches.
+  Ctrl+Alt+Shift+D detaches.
 - **"terminal does not support the kitty graphics protocol"**: you are not in kitty, or something between `tg` and kitty
   (tmux, an ssh jump with filtering) strips the protocol.
 - **The terminal is garbled after a crash**: run `reset`.
 - **Leftover processes or directories** after `tg` was killed with SIGKILL: run `tg --gc`.
 - **The program opened on your normal desktop** and `tg` exited at once: see the new-instance flags under [Use](#use).
-- **Alt+Shift shortcuts do nothing** (some GNOME setups intercept them): use another modifier for the detach key,
-  `TG_CLIENT_ARGS="--shortcut-modifiers=control+shift"`.
+- **Ctrl+Alt+Shift+D or Q do nothing** (the desktop or kitty took them): change the modifiers, e.g.
+  `TG_CLIENT_ARGS="--shortcut-modifiers=super+shift"` makes them Super+Shift+D and Super+Shift+Q.
 - **Anything else**: run with `-v` to keep the logs, or `-vv` to add client debug output, and read the files listed
   under [How it works](#how-it-works).
 
@@ -173,16 +180,18 @@ Logs in the session directory:
   the session, and exit statistics after it. They stay in the scrollback.
 - **Getting the prompt back**: the terminal is restored as soon as the program exits, but `tg` returns only after the
   X server has stopped. That takes about 1 s, and was seen to take 8 s at a load average of 38.
-- **Detach ends the program.** There is no reattach. Closing the kitty window ends the session too.
+- **Closing the kitty window ends the session**, as does a crash of the xpra client: only Ctrl+Alt+Shift+D detaches.
+- **No prefix keys**: xpra's shortcuts are single chords, so tmux-style `Ctrl+G d` is not possible yet.
 - **Programs that hand off to a running instance** (Firefox, Chromium, some Electron apps) open on the host desktop.
   Use their new-instance or profile flags.
 - **Programs that daemonize themselves** look as if they exited, and `tg` ends the session. A program that keeps
   running without a window is a problem in seamless mode, see below.
-- **Host shortcuts** such as Alt+Tab never reach the session. GNOME hosts may intercept some Alt+Shift combinations.
+- **Host shortcuts** such as Alt+Tab never reach the session. Desktops may intercept some Alt+Shift and
+  Ctrl+Alt combinations.
 - **No scaling**: the desktop is drawn 1:1 at 96 DPI. On HiDPI screens set `GDK_SCALE` or `QT_SCALE_FACTOR`; `tg`
   passes them through.
 - **Seamless mode** crops windows larger than the terminal and cannot reach covered windows. Keyboard input,
-  including the Alt+Shift+F4 detach key, only works while the program has a mapped window. With no window the session
+  including the detach and quit keys, only works while the program has a mapped window. With no window the session
   can only be ended by closing the kitty window or sending SIGTERM to `tg` from another shell.
 - **Performance**: kitty's rendering is the bottleneck for large animated windows. Over ssh, or without a shared
   `/dev/shm`, frames are sent as base64. A small `/dev/shm` can fill up under load. `XPRA_TERMINAL_SHM=0` avoids shared
@@ -230,8 +239,8 @@ The three test tiers:
 1. **Unit tests** (`tests/unit`) cover argument parsing, terminal checks, environments and the exact xpra command
    lines. They run in `nix flake check` and every package build.
 2. **Fake-kitty smoke test** (`tests/fakekitty/run.sh`) runs real sessions in a pty that answers kitty's queries. It
-   checks the X screen size and resize, exit statuses, detach with Alt+Shift+F4, decodable frames, logs, refusals,
-   `--gc` after SIGTERM and SIGKILL, listing and attaching to a plain xpra server, and leftovers.
+   checks the X screen size and resize, exit statuses, detach, reattach, takeover and quit, decodable frames, logs,
+   refusals, `--gc` after SIGTERM and SIGKILL, listing and attaching to a plain xpra server, and leftovers.
 3. **Real kitty end-to-end test** (`tests/kitty/e2e.sh`) drives kitty with XTEST input. It checks the fill, typing,
    resize, the pointer, window switching, shortcuts and detach, app exit, a client crash, hangup, two concurrent
    sessions, and popup menus in a GTK program. Screenshots go to `tests/kitty/out/`.

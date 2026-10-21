@@ -228,8 +228,8 @@ class Environments(unittest.TestCase):
 class ServerCmd(unittest.TestCase):
     def head(self, sub, fd=9):
         return [tg.XPRA, sub, "--daemon=no", f"--displayfd={fd}", f"--bind={R}/x.sock", f"--socket-dirs={R}",
-                f"--socket-dir={R}", f"--sessions-dir={R}/s", f"--log-dir={R}", "--exit-with-client=yes",
-                "--exit-with-children=no", "--start-new-commands=no", "--server-idle-timeout=300"]
+                f"--socket-dir={R}", f"--sessions-dir={R}/s", f"--log-dir={R}", "--exit-with-client=no",
+                "--exit-with-children=no", "--start-new-commands=no"]
 
     XORG = (f"--xvfb={tg.XORG} -noreset -novtswitch -nolisten tcp +extension GLX +extension RANDR "
             "+extension RENDER +extension Composite -extension DOUBLE-BUFFER "
@@ -256,6 +256,10 @@ class ServerCmd(unittest.TestCase):
         cmd = tg.build_server_cmd(SEAMLESS, R, 9, None, "xdummy", [])
         self.assertEqual(cmd, self.head("start") + [self.XORG] + tg.QUIET)
         self.assertFalse([a for a in cmd if a.startswith(("--resize-display", "--start=", "--start-late="))])
+
+    def test_session_name(self):
+        cmd = tg.build_server_cmd(SEAMLESS, R, 9, None, "xdummy", ["-d", "x11"], "xterm")
+        self.assertEqual(cmd[-len(tg.QUIET) - 3:-len(tg.QUIET) - 2], ["--session-name=xterm"])
 
     def test_extra_args_last(self):
         cmd = tg.build_server_cmd(DESKTOP, R, 9, None, "xdummy", ["--bell=yes", "-d", "x11"])
@@ -290,11 +294,13 @@ class ClientCmd(unittest.TestCase):
             tg.XPRA, "attach", SOCK, "--backend=terminal", "--reconnect=no",
             "--speaker=no", "--microphone=no", "--audio=no", "--webcam=no", "--notifications=no", "--printing=no",
             "--file-transfer=no", "--open-files=no", "--open-url=no", "--tray=no", "--mdns=no",
-            "--shortcut-modifiers=meta+shift", "--key-shortcut=clear", "--key-shortcut=#+F4:quit"])
+            "--shortcut-modifiers=control+meta+shift", "--key-shortcut=clear",
+            "--key-shortcut=#+d:quit", "--key-shortcut=#+D:quit",
+            '--key-shortcut=#+q:send("shutdown-server")', '--key-shortcut=#+Q:send("shutdown-server")'])
 
     def test_clear_before_quit(self):
         cmd = tg.build_client_cmd(DESKTOP, SOCK, [])
-        self.assertLess(cmd.index("--key-shortcut=clear"), cmd.index("--key-shortcut=#+F4:quit"))
+        self.assertLess(cmd.index("--key-shortcut=clear"), cmd.index("--key-shortcut=#+d:quit"))
 
     def test_debug_only_at_vv(self):
         self.assertNotIn("-d", tg.build_client_cmd({**DESKTOP, "verbose": 1}, SOCK, []))
@@ -315,7 +321,9 @@ class Misc(unittest.TestCase):
     def test_help_mentions_usage_and_keys(self):
         self.assertTrue(tg.HELP.startswith("tg - run an X11 GUI program inside this kitty terminal\n"))
         self.assertIn("\nusage: tg [-s] [-v] [--] COMMAND [ARGS...]\n", tg.HELP)
-        self.assertIn("Alt+Shift+F4", tg.HELP)
+        self.assertIn("Ctrl+Alt+Shift+D", tg.HELP)
+        self.assertIn("Ctrl+Alt+Shift+Q", tg.HELP)
+        self.assertNotIn("F4", tg.HELP)
 
 
 class FakeProc:
@@ -329,12 +337,14 @@ class FakeProc:
 class ExitClassification(unittest.TestCase):
     """Session.connection_ended: the client or the server went away; None means still running."""
 
-    def classify(self, client_rc, server_rc, sig=None):
-        with tempfile.TemporaryDirectory() as R, mock.patch.object(tg, "wait_until", return_value=False):
+    def classify(self, client_rc, server_rc, sig=None, reason=None):
+        with tempfile.TemporaryDirectory() as R, mock.patch.object(tg, "wait_until", return_value=False), \
+                mock.patch.object(tg, "disconnect_reason", return_value=reason):
             S = tg.Session(R, {"seamless": False, "verbose": 0}, ["app"], {})
             self.addCleanup(os.close, S.rwake)
             self.addCleanup(os.close, S.wwake)
             S.client, S.server, S.sig = FakeProc(client_rc), FakeProc(server_rc), sig
+            S.detach = mock.Mock(return_value="detached")
             self.messages = S.messages
             return S.connection_ended()
 
@@ -342,11 +352,14 @@ class ExitClassification(unittest.TestCase):
         self.assertEqual(self.classify(-signal.SIGHUP, None, signal.SIGHUP), 128 + signal.SIGHUP)
         self.assertEqual(self.messages, [])
 
-    def test_detach(self):
-        self.assertEqual(self.classify(0, None), 0)
-        self.assertEqual(self.classify(0, 0), 0)
+    def test_detach_leaves_the_server_running(self):
+        self.assertEqual(self.classify(0, None), "detached")
+        self.assertEqual(self.classify(1, None, reason="new client"), "detached")     # another client took over
 
-    def test_client_failure_takes_the_server_down_cleanly(self):
+    def test_quit_key_stops_the_server(self):
+        self.assertEqual(self.classify(0, 0, reason="server shutdown"), 0)
+
+    def test_client_failure(self):
         self.assertEqual(self.classify(143, None), 4)
         self.assertEqual(self.classify(143, 0), 4)
         self.assertEqual(self.classify(-9, 0), 4)
@@ -364,6 +377,17 @@ def session(R):
     os.close(S.rwake)
     os.close(S.wwake)
     return S
+
+
+class AdoptedProcess(unittest.TestCase):
+    def test_alive_until_it_exits(self):
+        p = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+        a = tg.Adopted(p)
+        self.assertIsNone(a.poll())
+        self.assertEqual(a.pid, p.pid)
+        p.stdin.close()
+        p.wait()
+        self.assertEqual(a.wait(), 0)
 
 
 class ForeignAppGroup(unittest.TestCase):
@@ -574,6 +598,24 @@ class ListServers(unittest.TestCase):
                 for s in socks:
                     s.close()
 
+    def test_tg_sockets_only_of_live_sessions(self):
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="tgu") as base:
+            os.chmod(base, 0o700)
+            socks = []
+            for name, pid in (("alive1", f"{os.getpid()} {tg.proc_start(os.getpid()).decode()}"), ("dead12", "1 1")):
+                os.mkdir(f"{base}/{name}")
+                with open(f"{base}/{name}/tg.pid", "w") as f:
+                    f.write(pid + "\n")
+                s = socket.socket(socket.AF_UNIX)
+                s.bind(f"{base}/{name}/x.sock")
+                socks.append(s)
+            os.mkdir(f"{base}/nosock")
+            try:
+                self.assertEqual(tg.tg_sockets({"TG_RUNTIME_DIR": base}, os.getuid()), [f"{base}/alive1/x.sock"])
+            finally:
+                for s in socks:
+                    s.close()
+
     def test_disconnect_reason(self):
         with tempfile.NamedTemporaryFile("w", suffix=".log") as f:
             f.write("2026-10-21 17:55:12,247 running, 1 windows\n"
@@ -590,10 +632,11 @@ class ListServers(unittest.TestCase):
 
     def test_nothing_running(self):
         errs = io.StringIO()
-        with mock.patch.object(tg, "find_sockets", return_value=[]), mock.patch.object(sys, "stderr", errs), \
+        with mock.patch.object(tg, "find_sockets", return_value=[]), mock.patch.object(tg, "tg_sockets", return_value=[]), \
+                mock.patch.object(sys, "stderr", errs), \
                 mock.patch.object(tg.subprocess, "Popen", side_effect=AssertionError("probed")):
             self.assertEqual(tg.main([]), 0)
-        self.assertIn("no running xpra servers", errs.getvalue())
+        self.assertIn("no tg sessions or xpra servers", errs.getvalue())
 
 
 class MainValidation(unittest.TestCase):

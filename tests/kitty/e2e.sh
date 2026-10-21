@@ -9,7 +9,7 @@
 #                   Not TG_RUNTIME_DIR: the suite deletes it and kills every process that mentions it.
 #   STEP            any of 1 3 4 5 6 2 7 8 9 10 11 (default: all, in that order: 3-6 reuse the session of step 1)
 #
-# Steps: 1 fill + size   2 typing   3 resize   4 pointer   5 window switching   6 shortcuts + detach
+# Steps: 1 fill + size   2 typing   3 resize   4 pointer   5 window switching   6 shortcuts + quit key
 #        7 app exit      8 client crash   9 hangup   10 two concurrent sessions   11 GTK popup menus
 # Screenshots go to tests/kitty/out/. Keyboard input is XTEST into the focused kitty window.
 set -uo pipefail
@@ -247,11 +247,11 @@ step6() {
   sleep 1
   "$H" xkey shift+F11
   check "6: Shift+F11 reaches the X program" within 5 xev_saw_shift_f11
-  "$H" xkey alt+shift+F4
+  "$H" xkey ctrl+alt+shift+q
   local rc; rc=$(wait_rc a 15)
-  check "6: Alt+Shift+F4 detaches with status 0 (got '$rc')" test "$rc" = 0
+  check "6: Ctrl+Alt+Shift+Q quits with status 0 (got '$rc')" test "$rc" = 0
   check "6: tty is cooked again, no staircase" tty_cooked 2
-  shot s6-after-detach >/dev/null
+  shot s6-after-quit >/dev/null
   check "6: session processes gone" gone "$RT/a/" 10
 }
 
@@ -308,8 +308,12 @@ step10() {
   KH_DIR=$KH_DIR2 "$H" stop >/dev/null
   check "10: closing the second kitty window ends its session" gone "$RT/g/" 15
   check "10: first session still alive" test -e "$r1/meta.json" -a -S "$r1/x.sock"
-  "$H" xkey alt+shift+F4
-  check "10: first session detaches" gone "$RT/f/" 15
+  "$H" xkey ctrl+alt+shift+d
+  local rc; rc=$(wait_rc f 15)
+  check "10: Ctrl+Alt+Shift+D detaches the first session with status 0 (got '$rc')" test "$rc" = 0
+  check "10: the detached session keeps running" test -e "$r1/meta.json" -a -S "$r1/x.sock"
+  kill -TERM "$(cut -d" " -f1 "$r1/tg.pid")"
+  check "10: stopping its supervisor ends it" gone "$RT/f/" 15
 }
 
 # popup_shown NAME: within 6 s the screen differs from s11-gtk by more than 2000 pixels (the pointer alone is ~70).
@@ -344,9 +348,9 @@ step11() {
   popup s11-context-menu 100 260 3
   popup s11-combo 448 260
   popup s11-header-menu 843 35
-  "$H" xkey alt+shift+F4
+  "$H" xkey ctrl+alt+shift+q
   local rc; rc=$(wait_rc h 15)
-  check "11: Alt+Shift+F4 detaches with status 0 (got '$rc')" test "$rc" = 0
+  check "11: Ctrl+Alt+Shift+Q quits with status 0 (got '$rc')" test "$rc" = 0
   check "11: tty is cooked again" tty_cooked 11
   check "11: session processes gone" gone "$RT/h/" 10
 }

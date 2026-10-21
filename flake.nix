@@ -38,7 +38,7 @@
             tg=${p.tg}/bin/tg
             $tg --version | grep -q '^tg ${version} (xpra '
             $tg --help | grep -q '^usage: tg'
-            $tg </dev/null 2>&1 | grep -q "no running xpra servers"          # bare tg lists
+            $tg </dev/null 2>&1 | grep -q "no tg sessions or xpra servers"  # bare tg lists
             rc=0; $tg -s </dev/null >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ]     # no COMMAND
             rc=0; $tg true </dev/null >/dev/null 2>err || rc=$?; [ "$rc" = 2 ]  # no tty
             grep -q 'must be the kitty terminal' err
