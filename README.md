@@ -67,7 +67,11 @@ sessions are not listed, because their client is already attached.
 as a session `tg` starts. Alt+Shift+F4 only detaches: the server and its programs keep running, and `tg` says so. A
 client already attached to that server is disconnected (xpra's default without `--sharing`). `-s` does not apply,
 and neither do the `TG_XSERVER`, `TG_TIMEOUT` and `TG_SERVER_ARGS` variables. Exit status: 0 after a detach or when
-the server shuts down, 2 if no server of yours answers on DISPLAY, 4 if the client failed.
+the server shuts down, 2 if no server of yours answers on DISPLAY or it is too old, 4 if the client failed.
+
+`tg`'s client is the pinned xpra 8.0 build, which refuses servers older than xpra 7.0. Distributions and nixpkgs
+still ship xpra 6.x, so a server started with the system `xpra` cannot be attached to: the listing marks it
+"too old" and `tg :N` refuses it.
 
 | Option | Meaning |
 |---|---|

@@ -540,11 +540,18 @@ class ListServers(unittest.TestCase):
         self.assertEqual(info, {"display": ":177", "machine-id": "", "session-name": "a=b"})
 
     def test_format_sorts_by_display_number(self):
-        lines = tg.format_servers([{"display": ":100", "session-type": "seamless", "session-name": "xterm"},
-                                   {"display": ":9", "session-type": "desktop"}])
-        self.assertEqual(lines, ["DISPLAY  TYPE      NAME",
-                                 ":9       desktop",
-                                 ":100     seamless  xterm"])
+        lines = tg.format_servers([{"display": ":100", "session-type": "seamless", "session-name": "xterm",
+                                    "version": "6.4.4"},
+                                   {"display": ":9", "session-type": "desktop", "version": "8.0"}])
+        self.assertEqual(lines, ["DISPLAY  TYPE      VERSION          NAME",
+                                 ":9       desktop   8.0",
+                                 ":100     seamless  6.4.4 (too old)  xterm"])
+
+    def test_too_old(self):
+        self.assertTrue(tg.too_old("6.4.4"))
+        self.assertTrue(tg.too_old("6"))
+        for v in ("7.0", "7.0.1", "8.0", "10.1", None, "", "garbage"):
+            self.assertFalse(tg.too_old(v), v)
 
     def test_find_sockets(self):
         with tempfile.TemporaryDirectory(dir="/tmp", prefix="tgu") as d:
@@ -610,6 +617,15 @@ class MainValidation(unittest.TestCase):
                 mock.patch.object(sys, "stderr", errs):
             self.assertEqual(tg.main([":6"]), 2)
         self.assertIn("no xpra server of yours answers on :6", errs.getvalue())
+
+    def test_attach_to_too_old_server(self):
+        errs = io.StringIO()
+        with mock.patch.object(tg, "check_terminal", return_value=None), \
+                mock.patch.object(tg, "probe_servers", return_value=[({"display": ":5", "version": "6.4.4"}, "/x")]), \
+                mock.patch.object(tg, "make_runtime_dir", side_effect=AssertionError("session started")), \
+                mock.patch.object(sys, "stderr", errs):
+            self.assertEqual(tg.main([":5"]), 2)
+        self.assertIn("version 6.4.4", errs.getvalue())
 
     def test_unbalanced_quotes(self):
         for var in ("TG_SERVER_ARGS", "TG_CLIENT_ARGS"):

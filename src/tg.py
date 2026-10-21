@@ -48,6 +48,7 @@ QUICK_EXIT = 3            # seconds; an app that exits sooner probably handed of
 TAIL_LINES = 20
 CASCADE_GRACE = 0.5     # seconds; see Session.supervise
 PROBE_TIMEOUT = 3         # seconds for `xpra id` to answer when listing servers
+MIN_SERVER = (7, 0)       # the pinned client refuses older servers (MIN_PROTOCOL_VERSION in xpra/net/common.py)
 
 HELP = """\
 tg - run an X11 GUI program inside this kitty terminal
@@ -277,15 +278,26 @@ def parse_id(text):
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
 
+def too_old(version):
+    """Whether an xpra version string ("6.4.4") is older than the client accepts; unknown versions are not."""
+    try:
+        return tuple(int(x) for x in version.split(".")[:2]) < MIN_SERVER
+    except (AttributeError, ValueError):
+        return False
+
+
 def format_servers(servers):
-    """Rows of a DISPLAY / TYPE / NAME table, one per server (dicts from parse_id), sorted by display number."""
+    """Rows of a DISPLAY / TYPE / VERSION / NAME table, one per server (dicts from parse_id), by display number."""
     def key(s):
         d = s.get("display", "").lstrip(":")
         return (0, int(d), "") if d.isdigit() else (1, 0, d)
-    rows = [("DISPLAY", "TYPE", "NAME")] + [(s.get("display", "?"), s.get("session-type", ""),
-                                             s.get("session-name", "")) for s in sorted(servers, key=key)]
-    w0, w1 = (max(len(r[i]) for r in rows) for i in (0, 1))
-    return [f"{a:<{w0}}  {b:<{w1}}  {c}".rstrip() for a, b, c in rows]
+    rows = [("DISPLAY", "TYPE", "VERSION", "NAME")]
+    for s in sorted(servers, key=key):
+        v = s.get("version", "?")
+        rows.append((s.get("display", "?"), s.get("session-type", ""), v + " (too old)" if too_old(v) else v,
+                     s.get("session-name", "")))
+    w = [max(len(r[i]) for r in rows) for i in range(3)]
+    return [f"{a:<{w[0]}}  {b:<{w[1]}}  {c:<{w[2]}}  {d}".rstrip() for a, b, c, d in rows]
 
 
 def exit_status(rc):
@@ -748,9 +760,11 @@ class Session:
         return 3
 
     def client_failed(self):
+        log = newest(os.path.join(self.R, "xpra", "xpra-terminal-*.log"))
+        # an attached-to server is not ours: no server.log; a client that fails early writes no log of its own
+        logs = ([os.path.relpath(log, self.R)] if log else []) + (["server.log"] if self.server else [])
         self.fail(f"xpra client failed (status {exit_status(self.client.returncode)}).",
-                  f"logs kept in {self.R} (xpra/xpra-terminal-*.log, server.log).",
-                  newest(os.path.join(self.R, "xpra", "xpra-terminal-*.log")))
+                  f"logs kept in {self.R} ({', '.join(logs)})." if logs else "its messages are above.", log)
         return 4
 
     def app_group_alive(self):
@@ -1009,9 +1023,14 @@ def main(argv):
         return 2
     display = opts["attach"]
     if display:
-        path = next((p for info, p in probe_servers(env) if info.get("display") == display), None)
+        info, path = next(((i, p) for i, p in probe_servers(env) if i.get("display") == display), (None, None))
         if path is None:
             err(f"no xpra server of yours answers on {display}.", "run tg without arguments to list them.")
+            return 2
+        if too_old(info.get("version")):
+            err(f"the xpra server on {display} is version {info['version']}; tg's xpra client needs "
+                f"{'.'.join(map(str, MIN_SERVER))} or newer.",
+                "restart the program under a newer xpra, or start it with tg COMMAND instead.")
             return 2
     else:
         exe = cmd[0]
