@@ -26,6 +26,7 @@ the first install compiles it.
 tg firefox --new-instance -P tg   # options after COMMAND belong to COMMAND
 tg -- gimp image.png
 tg -s xterm                       # seamless mode, see below
+tg --wm=i3 firefox                # tile windows instead of showing one at a time
 tg                                # list detached sessions and other xpra servers
 tg :100                           # attach to one of them
 ```
@@ -51,7 +52,7 @@ Keys inside the session:
 ## Options and environment
 
 ```
-tg [-s] [-v] [--] COMMAND [ARGS...]
+tg [-s | --wm=WM] [-v] [--] COMMAND [ARGS...]
 tg [-v] :DISPLAY
 tg
 tg --gc
@@ -78,6 +79,7 @@ still ship xpra 6.x, so a server started with the system `xpra` cannot be attach
 | Option | Meaning |
 |---|---|
 | `-s`, `--seamless` | Seamless mode: no window manager; each X window is drawn at its own X position. |
+| `--wm=WM` | The desktop's window manager, see [Window managers](#window-managers). Not with `-s`. |
 | `-v`, `--verbose` | Keep the session directory and logs on success and print its path. `-vv` also enables xpra client debug logging. |
 | `-V`, `--version` | Print the tg and xpra versions. |
 | `-h`, `--help` | Help. |
@@ -109,7 +111,8 @@ kitty
 
 - **Desktop mode** (default): xpra serves the whole X screen as one desktop. The screen starts at the terminal's text
   area size in pixels and follows it on every resize. matchbox, without title bars, fits the program's window to the
-  screen.
+  screen; another window manager can be chosen with `--wm`.
+- **Window manager**: matchbox by default; `--wm` picks another, see below.
 - **Seamless mode** (`-s`): no window manager. Each X window is drawn at its own position. Windows larger than the
   terminal are cropped, and covered windows cannot be reached.
 - **X server**: Xorg with xpra's dummy driver can resize to any size up to 7680x4320. `TG_XSERVER=xvfb` uses Xvfb with
@@ -117,8 +120,8 @@ kitty
 - **Graphics**: frames go to kitty through shared memory (`/dev/shm`) when kitty and `tg` run on the same machine,
   otherwise as base64-encoded images in the terminal stream.
 - **Isolation**: every session has its own directory (`$TG_RUNTIME_DIR/<id>`) holding the xpra socket, the
-  Xauthority file and xpra's runtime and config directories. Nothing under `$HOME` is written. The X display number is
-  picked by the X server, so several `tg` sessions can run at the same time. The host's xpra configuration
+  Xauthority file and xpra's runtime, config and cache directories. Nothing under `$HOME` is written, except by a
+  window manager of your own given to `--wm`. The X display number is picked by the X server, so several `tg` sessions can run at the same time. The host's xpra configuration
   (`/etc/xpra`, `/etc/xdg/xpra`, `~/.xpra`, `~/.config/xpra`) is not read. COMMAND gets your environment, minus
   `WAYLAND_DISPLAY`, plus `DISPLAY`, `XAUTHORITY` (the session's Xauthority file), `TG_SESSION` (the path of the
   session directory, where the logs below are written) and variables that make GTK, Qt, Firefox and SDL use X11
@@ -132,6 +135,23 @@ kitty
   prompt, and forks a background supervisor (recorded in the session's `tg.pid`) that keeps watching COMMAND and the
   server and cleans up as above. The server does not exit with its client (`--exit-with-client=no`). SIGTERM to the
   supervisor ends the session.
+
+### Window managers
+
+In desktop mode one window manager arranges the program's windows on the fitted screen:
+
+| `--wm=` | Windows | Keys |
+|---|---|---|
+| `matchbox` (default) | one at a time, full screen, stacked like cards; no title bars | Alt+Shift+n / Alt+Shift+p: next / previous window |
+| `i3` | tiled side by side; no bar | Alt+Shift+n / p: next / previous; Alt+Shift+arrows: focus by direction; Alt+Shift+h/j/k/l: move the window; Alt+Shift+e: toggle split direction; Alt+Shift+t / s: tabbed / stacked; Alt+Shift+f: fullscreen; Alt+Shift+space: floating; Alt+drag: move a floating window |
+| `openbox` | overlapping, with title bars: drag to move, edges to resize, double-click to maximize | Alt+Shift+n / p: next / previous; Alt+drag moves, Alt+right-drag resizes |
+| any command | whatever that window manager does | its own |
+
+tg's matchbox, i3 and openbox come from the flake with configs in `share/tg` (`matchbox-kbdconfig`, `i3-config`,
+`openbox-rc.xml`), and never read yours. Any other value is a command found on your PATH, for example
+`--wm=dwm` or `--wm='awesome -c ~/x.lua'`; it runs with your `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`, so it loads its
+usual configuration. All keys are Alt+Shift so they don't collide with the program's Alt+letter menu mnemonics or
+the host desktop's Super bindings.
 
 Logs in the session directory:
 
@@ -210,12 +230,12 @@ Logs in the session directory:
 ## Development
 
 ```
-flake.nix, flake.lock       packages (tg, xpra, matchbox), apps, checks, devShell
+flake.nix, flake.lock       packages (tg, xpra, matchbox), apps, checks, devShell (tg also uses nixpkgs' i3, openbox)
 nix/xpra.nix                nixpkgs' xpra, built from the pinned xpra-src input, no patches
 nix/matchbox.nix            nixpkgs' matchbox, patched to ignore NumLock/CapsLock in its key bindings
 nix/tg.nix                  installs src/tg.py with store paths substituted (no wrapper)
 src/tg.py                   the whole program, Python 3 standard library only
-src/share/matchbox-kbdconfig
+src/share/                  matchbox-kbdconfig, i3-config, openbox-rc.xml: the --wm configs
 tests/unit/                 unit tests of the pure functions (run by the package's checkPhase)
 tests/dev-link.sh           a runnable tg from existing store paths, without building the flake
 tests/fakekitty/            smoke test in a fake-kitty pty: no kitty or GPU needed
@@ -276,6 +296,6 @@ Upstream xpra changes that would remove workarounds in `tg`:
 ## Credits and license
 
 Built on [xpra](https://github.com/Xpra-org/xpra) and its kitty terminal backend (PR #5012),
-[kitty](https://sw.kovidgoyal.net/kitty/) and matchbox-window-manager.
+[kitty](https://sw.kovidgoyal.net/kitty/), matchbox-window-manager, i3 and openbox.
 
 MIT, see [LICENSE](LICENSE).

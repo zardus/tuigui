@@ -12,12 +12,13 @@ pkg() { nix build --no-link --print-out-paths --inputs-from "$repo" "nixpkgs#$1"
 XORGSERVER=$(pkg xorg-server)
 MATCHBOX=$(nix build --no-link --print-out-paths "$repo#matchbox")   # patched, see nix/matchbox.nix
 PY=$(pkg python3)
+I3=$(pkg i3) OPENBOX=$(pkg openbox)
 xpra_version=${XPRA#*-xpra-}      # from the store path name; running xpra here could write ~/.config/xpra
 
 mkdir -p "$OUT/share"
-cp "$repo/src/share/matchbox-kbdconfig" "$OUT/share/"
+cp "$repo/src/share/matchbox-kbdconfig" "$repo/src/share/i3-config" "$repo/src/share/openbox-rc.xml" "$OUT/share/"
 sed -e "s|@python3@|$PY/bin/python3|" -e "s|@xpra@|$XPRA|" -e "s|@xorgserver@|$XORGSERVER|" \
-    -e "s|@matchbox@|$MATCHBOX|" -e "s|@share@|$OUT/share|" -e "s|@version@|dev (xpra $xpra_version)|" \
+    -e "s|@matchbox@|$MATCHBOX|" -e "s|@i3@|$I3|" -e "s|@openbox@|$OPENBOX|" -e "s|@share@|$OUT/share|" -e "s|@version@|dev (xpra $xpra_version)|" \
     "$repo/src/tg.py" > "$OUT/tg.new"
 chmod 755 "$OUT/tg.new"
 mv "$OUT/tg.new" "$OUT/tg"

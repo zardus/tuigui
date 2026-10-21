@@ -57,6 +57,15 @@ class ParseArgs(unittest.TestCase):
         self.assertTrue(tg.parse_args([])[0]["list"])
         self.assertFalse(tg.parse_args(["xterm"])[0]["list"])
 
+    def test_wm(self):
+        self.assertIsNone(tg.parse_args(["xterm"])[0]["wm"])
+        self.assertEqual(tg.parse_args(["--wm=i3", "xterm"])[0]["wm"], "i3")
+        self.assertEqual(tg.parse_args(["--wm", "dwm -s", "xterm"]), ({**tg.parse_args(["xterm"])[0], "wm": "dwm -s"},
+                                                                        ["xterm"]))
+        for argv in (["--wm"], ["--wm="], ["--wm=", "xterm"], ["-s", "--wm=i3", "xterm"], ["--wm=i3", ":5"]):
+            with self.assertRaises(tg.Usage, msg=argv):
+                tg.parse_args(argv)
+
     def test_display_attaches(self):
         opts, _ = tg.parse_args(["-v", ":177"])
         self.assertEqual((opts["attach"], opts["verbose"]), (":177", 1))
@@ -201,6 +210,7 @@ class Environments(unittest.TestCase):
         e = tg.xpra_env(USER, R, True)
         self.assertEqual(e["XDG_RUNTIME_DIR"], R)
         self.assertEqual(e["XDG_CONFIG_HOME"], R + "/cfg")
+        self.assertEqual(e["XDG_CACHE_HOME"], R + "/cache")
         self.assertEqual(e["XPRA_SYSTEM_CONF_DIRS"], tg.XPRA_PREFIX + "/etc/xpra")
         self.assertEqual(e["XPRA_USER_CONF_DIRS"], R + "/cfg/xpra")
         a = tg.app_env(USER, R, ":5")
@@ -261,6 +271,19 @@ class ServerCmd(unittest.TestCase):
         cmd = tg.build_server_cmd(SEAMLESS, R, 9, None, "xdummy", ["-d", "x11"], "xterm")
         self.assertEqual(cmd[-len(tg.QUIET) - 3:-len(tg.QUIET) - 2], ["--session-name=xterm"])
 
+    def test_wm_commands(self):
+        self.assertEqual(tg.wm_command(None, {}), tg.wm_command("matchbox", {}))
+        self.assertEqual(tg.wm_command("i3", {}), f"{tg.I3} -c {tg.SHARE}/i3-config")
+        self.assertEqual(tg.wm_command("openbox", {}), f"{tg.OPENBOX} --config-file {tg.SHARE}/openbox-rc.xml")
+        # any other window manager gets your config and cache dirs back, not the session's
+        self.assertEqual(shlex.split(tg.wm_command("dwm -s", {"XDG_CONFIG_HOME": "/home/u/my cfg"})),
+                         ["env", "XDG_CONFIG_HOME=/home/u/my cfg", "--unset=XDG_CACHE_HOME", "dwm", "-s"])
+
+    def test_wm_in_desktop_mode_only(self):
+        cmd = tg.build_server_cmd({**DESKTOP, "wm": "i3"}, R, 9, None, "xdummy", [])
+        self.assertIn(f"--start-late={tg.I3} -c {tg.SHARE}/i3-config", cmd)
+        self.assertNotIn(self.WM, cmd)
+
     def test_extra_args_last(self):
         cmd = tg.build_server_cmd(DESKTOP, R, 9, None, "xdummy", ["--bell=yes", "-d", "x11"])
         self.assertEqual(cmd[-3:], ["--bell=yes", "-d", "x11"])
@@ -320,7 +343,7 @@ class Misc(unittest.TestCase):
 
     def test_help_mentions_usage_and_keys(self):
         self.assertTrue(tg.HELP.startswith("tg - run an X11 GUI program inside this kitty terminal\n"))
-        self.assertIn("\nusage: tg [-s] [-v] [--] COMMAND [ARGS...]\n", tg.HELP)
+        self.assertIn("\nusage: tg [-s | --wm=WM] [-v] [--] COMMAND [ARGS...]\n", tg.HELP)
         self.assertIn("Ctrl+Alt+Shift+D", tg.HELP)
         self.assertIn("Ctrl+Alt+Shift+Q", tg.HELP)
         self.assertNotIn("F4", tg.HELP)

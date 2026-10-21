@@ -1,4 +1,4 @@
-{ lib, stdenvNoCC, python3, xpra, matchbox, xorg-server, src, version }:
+{ lib, stdenvNoCC, python3, xpra, matchbox, i3, openbox, xorg-server, src, version }:
 stdenvNoCC.mkDerivation {
   pname = "tuigui";
   inherit version src;
@@ -7,12 +7,14 @@ stdenvNoCC.mkDerivation {
 
   installPhase = ''
     install -Dm755 src/tg.py $out/bin/tg
-    install -Dm644 src/share/matchbox-kbdconfig -t $out/share/tg
+    install -Dm644 src/share/matchbox-kbdconfig src/share/i3-config src/share/openbox-rc.xml -t $out/share/tg
     substituteInPlace $out/bin/tg \
       --replace-fail '@python3@'    '${python3}/bin/python3' \
       --replace-fail '@xpra@'       '${xpra}' \
       --replace-fail '@xorgserver@' '${xorg-server}' \
       --replace-fail '@matchbox@'   '${matchbox}' \
+      --replace-fail '@i3@'         '${i3}' \
+      --replace-fail '@openbox@'    '${openbox}' \
       --replace-fail '@share@'      "$out/share/tg" \
       --replace-fail '@version@'    '${version} (xpra ${xpra.version})'
   '';

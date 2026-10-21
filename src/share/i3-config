@@ -1,0 +1,32 @@
+# tuigui: i3 for tg --wm=i3. Windows tile; every binding is Alt+Shift+key, like matchbox's next/prev
+# (plain Alt+letter collides with menu mnemonics, Super is often grabbed by the host desktop).
+# No bar, no launcher, no exit binding: the session ends with the program (or Ctrl+Alt+Shift+Q).
+font pango:monospace 9
+default_border normal 1
+default_floating_border normal 1
+hide_edge_borders smart
+focus_follows_mouse no
+focus_on_window_activation focus
+floating_modifier Mod1
+workspace_layout default
+
+# focus: next / previous window, or by direction
+bindsym Mod1+Shift+n focus next
+bindsym Mod1+Shift+p focus prev
+bindsym Mod1+Shift+Left focus left
+bindsym Mod1+Shift+Right focus right
+bindsym Mod1+Shift+Up focus up
+bindsym Mod1+Shift+Down focus down
+
+# move the focused window
+bindsym Mod1+Shift+h move left
+bindsym Mod1+Shift+l move right
+bindsym Mod1+Shift+k move up
+bindsym Mod1+Shift+j move down
+
+# layout of the focused container: tiled (toggle direction), tabbed, stacked; fullscreen; floating
+bindsym Mod1+Shift+e layout toggle split
+bindsym Mod1+Shift+t layout tabbed
+bindsym Mod1+Shift+s layout stacking
+bindsym Mod1+Shift+f fullscreen toggle
+bindsym Mod1+Shift+space floating toggle

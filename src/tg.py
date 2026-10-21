@@ -26,6 +26,8 @@ XPRA = XPRA_PREFIX + "/bin/xpra"
 XORG = "@xorgserver@/bin/Xorg"
 XVFB = "@xorgserver@/bin/Xvfb"
 MATCHBOX = "@matchbox@/bin/matchbox-window-manager"
+I3 = "@i3@/bin/i3"
+OPENBOX = "@openbox@/bin/openbox"
 SHARE = "@share@"
 
 QUIET = ["--mdns=no", "--dbus-launch=no", "--dbus=no", "--dbus-control=no", "--notifications=no",
@@ -57,7 +59,7 @@ MIN_SERVER = (7, 0)       # the pinned client refuses older servers (MIN_PROTOCO
 HELP = """\
 tg - run an X11 GUI program inside this kitty terminal
 
-usage: tg [-s] [-v] [--] COMMAND [ARGS...]
+usage: tg [-s | --wm=WM] [-v] [--] COMMAND [ARGS...]
        tg [-v] :DISPLAY
        tg
        tg --gc | --help | --version
@@ -76,6 +78,9 @@ client already attached to it.
 
 options:
   -s, --seamless   draw each X window where it is instead of one fitted desktop
+      --wm=WM      the desktop's window manager: matchbox (default; one window at
+                   a time, full screen), i3 (tiling), openbox (overlapping
+                   windows), or any other window manager command on your PATH
   -v, --verbose    keep logs on success and print their location (-vv: client debug)
   -V, --version    print versions
   -h, --help       this text
@@ -85,6 +90,8 @@ keys inside the session:
   Ctrl+Alt+Shift+D         detach: COMMAND keeps running, tg :DISPLAY reattaches
   Ctrl+Alt+Shift+Q         quit: end COMMAND and its X session
   Alt+Shift+n / Alt+Shift+p  next / previous window (dialogs, extra windows)
+  --wm=i3 also: Alt+Shift+arrows focus, Alt+Shift+h/j/k/l move, Alt+Shift+e/t/s
+           split / tabbed / stacked, Alt+Shift+f fullscreen, Alt+Shift+space float
   everything else, including Ctrl+C, goes to the program
 
 environment: TG_XSERVER=xdummy|xvfb  TG_RUNTIME_DIR=DIR  TG_TIMEOUT=SECS
@@ -114,7 +121,7 @@ def err(cause, action=None):
 def parse_args(argv):
     """Returns (opts, cmd). Options stop at the first non-option or '--'."""
     opts = {"seamless": False, "verbose": 0, "gc": False, "help": False, "version": False, "list": not argv,
-            "attach": None}
+            "attach": None, "wm": None}
     argv = list(argv)
     i = 0
     while i < len(argv):
@@ -139,6 +146,14 @@ def parse_args(argv):
             opts["version"] = True
         elif a == "--gc":
             opts["gc"] = True
+        elif a == "--wm" or a.startswith("--wm="):
+            if a == "--wm":
+                if i + 1 >= len(argv):
+                    raise Usage("--wm needs a window manager", "see tg --help")
+                i += 1
+            opts["wm"] = argv[i] if a == "--wm" else a[len("--wm="):]
+            if not opts["wm"].strip():
+                raise Usage("--wm needs a window manager", "see tg --help")
         else:
             raise Usage(f"unknown option {a!r}", "see tg --help")
         i += 1
@@ -151,9 +166,12 @@ def parse_args(argv):
         if len(cmd) > 1:
             raise Usage(f"tg {cmd[0]} takes no COMMAND: it attaches to the programs already running there",
                         "see tg --help")
-        if opts["seamless"]:
-            raise Usage("-s does not apply when attaching: the server decides its mode", "see tg --help")
+        if opts["seamless"] or opts["wm"]:
+            raise Usage(f"{'-s' if opts['seamless'] else '--wm'} does not apply when attaching: "
+                        "the server already runs", "see tg --help")
         opts["attach"] = cmd[0]
+    if opts["seamless"] and opts["wm"]:
+        raise Usage("-s and --wm do not go together: seamless mode has no window manager", "see tg --help")
     if not opts["gc"] and not cmd:
         raise Usage("no COMMAND given", "see tg --help")
     return opts, cmd
@@ -220,6 +238,7 @@ def xpra_env(env, R, with_xauth):
     e = {k: v for k, v in env.items() if k not in XPRA_SCRUB}
     e["XDG_RUNTIME_DIR"] = R
     e["XDG_CONFIG_HOME"] = os.path.join(R, "cfg")
+    e["XDG_CACHE_HOME"] = os.path.join(R, "cache")       # openbox logs there
     # only the pinned build's conf.d: not /etc/xpra, /etc/xdg/xpra, ~/.xpra or ~/.config/xpra
     e["XPRA_SYSTEM_CONF_DIRS"] = XPRA_PREFIX + "/etc/xpra"
     e["XPRA_USER_CONF_DIRS"] = os.path.join(R, "cfg", "xpra")
@@ -234,7 +253,21 @@ def app_env(env, R, display):
     return e
 
 
-def build_server_cmd(opts, R, w_fd, size, xserver, extra, name=None):
+def wm_command(wm, env):
+    """The --start-late command line (xpra shlex-splits it) of the desktop's window manager. tg's own window
+    managers get tg's configs; any other runs with your config dirs instead of the session's."""
+    q = shlex.quote
+    if wm in (None, "matchbox"):
+        return f"{q(MATCHBOX)} -use_titlebar no -use_cursor yes -kbdconfig {q(SHARE + '/matchbox-kbdconfig')}"
+    if wm == "i3":
+        return f"{q(I3)} -c {q(SHARE + '/i3-config')}"
+    if wm == "openbox":
+        return f"{q(OPENBOX)} --config-file {q(SHARE + '/openbox-rc.xml')}"
+    restore = [f"{k}={env[k]}" if k in env else f"--unset={k}" for k in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME")]
+    return shlex.join(["env", *restore, *shlex.split(wm)])
+
+
+def build_server_cmd(opts, R, w_fd, size, xserver, extra, name=None, env=None):
     sub = "start" if opts["seamless"] else "start-desktop"
     q = shlex.quote                            # xpra shlex-splits --xvfb and --start-late
     xa = q(os.path.join(R, "Xauthority"))
@@ -253,10 +286,8 @@ def build_server_cmd(opts, R, w_fd, size, xserver, extra, name=None):
         # initial resolutions are a dummy-driver feature; Xvfb starts at its -screen size and is re-fitted
         rd = "yes" if (size is None or xserver == "xvfb") else f"yes:{size[0]}x{size[1]}"
         # --start-late: xpra records the root cursor at setup as "default" and never draws it; with --start,
-        # matchbox could set its arrow first and the arrow then went invisible over most windows
-        cmd += [f"--resize-display={rd}",
-                (f"--start-late={q(MATCHBOX)} -use_titlebar no -use_cursor yes "
-                 f"-kbdconfig {q(SHARE + '/matchbox-kbdconfig')}")]
+        # the window manager could set its arrow first and the arrow then went invisible over most windows
+        cmd += [f"--resize-display={rd}", f"--start-late={wm_command(opts.get('wm'), env or {})}"]
     if name:
         cmd.append(f"--session-name={name}")             # what the listing shows
     return cmd + QUIET + extra
@@ -379,7 +410,7 @@ def session_pids(R):
     r = R.encode()
     env_marks = (b"\0XDG_RUNTIME_DIR=" + r + b"\0", b"\0TG_SESSION=" + r + b"\0",
                  b"\0XAUTHORITY=" + r + b"/Xauthority\0")
-    exes = tuple(p.encode() for p in (XPRA_PREFIX + "/bin/", XORG, XVFB, MATCHBOX))
+    exes = tuple(p.encode() for p in (XPRA_PREFIX + "/bin/", XORG, XVFB, MATCHBOX, I3, OPENBOX))
     uid, me, out = os.getuid(), os.getpid(), []
     for name in os.listdir("/proc"):
         if not name.isdigit() or int(name) == me:
@@ -518,7 +549,7 @@ def make_runtime_dir(env):
     with open(os.path.join(R, "tg.pid"), "w") as f:
         f.write(f"{os.getpid()} {proc_start(os.getpid()).decode()}\n")
     os.chmod(R, 0o700)
-    for sub in ("s", "cfg", "xpra", "xorg.conf.d"):
+    for sub in ("s", "cfg", "cache", "xpra", "xorg.conf.d"):
         os.mkdir(os.path.join(R, sub), 0o700)
     os.close(os.open(os.path.join(R, "Xauthority"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     return R
@@ -594,7 +625,7 @@ class Session:
     def start_server(self, size):
         r, w = os.pipe()
         cmd = build_server_cmd(self.opts, self.R, w, size, self.env.get("TG_XSERVER", "xdummy"), self.server_extra,
-                               os.path.basename(self.cmd[0]))
+                               os.path.basename(self.cmd[0]), self.env)
         self.note("server: " + shlex.join(cmd))
         with open(os.path.join(self.R, "server.log"), "ab") as serverlog:
             self.server = subprocess.Popen(cmd, env=xpra_env(self.env, self.R, True), start_new_session=True,
@@ -669,6 +700,7 @@ class Session:
 
     def write_meta(self):
         meta = {"argv": self.cmd, "mode": "seamless" if self.opts["seamless"] else "desktop",
+                "wm": None if self.opts["seamless"] else self.opts.get("wm") or "matchbox",
                 "display": self.display, "started": self.started, "cwd": os.getcwd(),
                 "pids": {"server": self.server.pid, "app": self.app.pid if self.app else None,
                          "x": sorted(self.x_pids)}}
@@ -1131,6 +1163,17 @@ def main(argv):
         if not (os.access(exe, os.X_OK) if "/" in exe else shutil.which(exe)):
             err(f"command not found: {exe}")
             return 2
+        wm = opts["wm"]
+        if wm not in (None, "matchbox", "i3", "openbox"):
+            try:
+                words = shlex.split(wm)
+            except ValueError as e:
+                err(f"--wm: {e}.")
+                return 2
+            if not words or not (os.access(words[0], os.X_OK) if "/" in words[0] else shutil.which(words[0])):
+                err(f"window manager not found: {words[0] if words else wm!r}",
+                    "use matchbox, i3, openbox, or a window manager command on your PATH.")
+                return 2
     try:
         timeout = float(env.get("TG_TIMEOUT", "60"))
     except ValueError:

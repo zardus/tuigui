@@ -5,7 +5,7 @@
 #   TG              tg to test, e.g. the dev-linked one from tests/dev-link.sh (required)
 #   TG_SMOKE_DIR    scratch parent, wiped at start; must be short (AF_UNIX) (default /tmp/tg-smoke-$UID).
 #                   Not TG_RUNTIME_DIR: the suite deletes it and kills every process that mentions it.
-#   TEST            any of 1 2 3 4 5 6 7 8 9 10 (default: all)
+#   TEST            any of 1 2 3 4 5 6 7 8 9 10 11 (default: all)
 #   RESIZE_AT       seconds after start when the fake terminal shrinks (default 8; raise it on a loaded host)
 #
 # Tests: 1 desktop/xdummy size, resize, exit status, frames, logs   2 client killed -> exit 4
@@ -15,6 +15,7 @@
 #        8 client fails at startup -> 4, promptly
 #        9 tg lists a plain xpra server, tg :N attaches, detach leaves it running, quit stops it
 #       10 tg :N from another terminal takes a session over: the first tg detaches
+#       11 --wm: i3 tiles two windows, openbox, and a window manager given as a command
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -246,6 +247,8 @@ test5() {
   refuse t5-nocmd "no COMMAND" fk "$BASE/t5-nocmd.bin" env TG_RUNTIME_DIR="$rt" "$TG" -s
   refuse t5-nodisplay "no xpra server" fk "$BASE/t5-nodisplay.bin" \
     env TG_RUNTIME_DIR="$rt" XDG_RUNTIME_DIR="$rt" "$TG" :4242
+  refuse t5-nowm "window manager not found" fk "$BASE/t5-nowm.bin" \
+    env TG_RUNTIME_DIR="$rt" "$TG" --wm=no-such-wm-xyz "$XTERM"
   refuse t5-notfound "command not found" fk "$BASE/t5-notfound.bin" \
     env TG_RUNTIME_DIR="$rt" "$TG" no-such-command-xyz
   refuse t5-longdir "too long" fk "$BASE/t5-longdir.bin" env TG_RUNTIME_DIR="$long" "$TG" "$XTERM"
@@ -324,6 +327,58 @@ test10() {
   no_leftovers t10 "$dpy"
 }
 
+# x11 R PROGRAM ARGS...: run an X client against session R's display
+x11() { local R=$1; shift; DISPLAY=$(display_of "$R") XAUTHORITY=$R/Xauthority "$@"; }
+
+# wm_name R: the _NET_WM_NAME of session R's window manager
+wm_name() {
+  local id
+  id=$(x11 "$1" "$XPROP" -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | awk '{print $NF}')
+  [[ $id == 0x* ]] && x11 "$1" "$XPROP" -id "$id" _NET_WM_NAME 2>/dev/null | sed -n 's/.*= "\(.*\)"/\1/p'
+}
+
+# wait_wm R NAME TIMEOUT
+wait_wm() { local end=$((SECONDS + $3)); until [[ $(wm_name "$1") == "$2" ]] || ((SECONDS > end)); do sleep 0.3; done
+            [[ $(wm_name "$1") == "$2" ]]; }
+
+# widths R: the widths of the xterms titled one and two, e.g. "596 596"
+widths() {
+  x11 "$1" "$XWININFO" -root -tree |
+    awk '/"(one|two)": \("xterm"/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+x[0-9]+\+/) { split($i, a, "x"); print a[1]; break } }' |
+    paste -sd' '
+}
+
+# Two xterms under WM (a --wm value), quit with Ctrl+Alt+Shift+Q. wm_session NAME WM EXPECTED_WM_NAME
+wm_session() {
+  local name=$1 wm=$2 want=$3 rt=$BASE/$1 out=$BASE/$1.bin R rc dpy
+  mkdir -m 700 "$rt"
+  DUR=60 INPUT="$QUIT_KEY@25" fk "$out" env TG_RUNTIME_DIR="$rt" "$TG" --wm="$wm" -- \
+    sh -c "\"\$0\" -title one -e sleep 600 & \"\$0\" -title two -e sleep 600" "$XTERM" &
+  local fkpid=$!
+  if ! R=$(session_dir "$rt" 90); then fail "$name: session became ready"; wait "$fkpid"; return; fi
+  dpy=$(display_of "$R")
+  check "$name: the window manager is $want" wait_wm "$R" "$want" 15
+  if [[ $name == t11-i3 ]]; then
+    sleep 3
+    WIDTHS=$(widths "$R")
+    info "$name: xterm widths $WIDTHS (screen 1200)"
+    check "$name: two windows tiled side by side" \
+      python3 -I -c 'import sys; w = [int(x) for x in sys.argv[1:]]; sys.exit(not (len(w) == 2 and all(x < 700 for x in w)))' $WIDTHS
+  fi
+  wait "$fkpid"; rc=$?
+  check "$name: tg exit status $rc == 0 after Ctrl+Alt+Shift+Q" test "$rc" = 0
+  check "$name: an inline frame decodes" frames "$out"
+  check "$name: session dir removed" wait_gone "$R" 10
+  no_leftovers "$name" "$dpy"
+}
+
+test11() {
+  wm_session t11-i3 i3 i3
+  wm_session t11-openbox openbox Openbox
+  # any other window manager command: here the bare openbox binary, with no tg config
+  wm_session t11-cmd "$(dirname "$(sed -n 's/^OPENBOX = "\(.*\)"$/\1/p' "$TG")")/openbox --sm-disable" Openbox
+}
+
 # a client that exits before its hello: tg must stop the server with `xpra stop`, promptly
 test8() {
   local rt=$BASE/t8 out=$BASE/t8.bin rc t0 tc R
@@ -400,11 +455,12 @@ main() {
   [[ -x $TG ]] || { echo "TG=$TG is not executable"; exit 2; }
   rm -rf "$BASE" && (umask 077 && mkdir -p "$BASE")
   XRANDR=$(nixbin xrandr xrandr) XTERM=$(nixbin xterm xterm) XCLOCK=$(nixbin xclock xclock)
+  XPROP=$(nixbin xprop xprop) XWININFO=$(nixbin xwininfo xwininfo)
   XPRA=$(sed -n 's/^XPRA_PREFIX = "\(.*\)"$/\1/p' "$TG")/bin/xpra XVFB=$(sed -n 's/^XVFB = "\(.*\)"$/\1/p' "$TG")
   SHM_BEFORE=$(shm_objects)
   trap cleanup EXIT
   local tests=("$@") t
-  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8 9 10)
+  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8 9 10 11)
   for t in "${tests[@]}"; do echo "== test $t"; "test$t"; done
   echo "== $PASSES passed, $FAILS failed (outputs in $BASE)"
   ((FAILS == 0))

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- tuigui: openbox for tg's wm=openbox. Overlapping windows with title bars, moved and resized with the
+     mouse; Alt+Shift+n/p cycle windows like matchbox's. No root menu, no desktops, no other keys, and no
+     iconify button: without a taskbar an iconified window could only be found with Alt+Shift+n. -->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+  </focus>
+  <placement>
+    <policy>Smart</policy>
+  </placement>
+  <theme>
+    <titleLayout>NLMC</titleLayout>
+    <keepBorder>yes</keepBorder>
+  </theme>
+  <desktops>
+    <number>1</number>
+  </desktops>
+  <keyboard>
+    <keybind key="A-S-n">
+      <action name="NextWindow"><dialog>none</dialog><finalactions><action name="Focus"/><action name="Raise"/></finalactions></action>
+    </keybind>
+    <keybind key="A-S-p">
+      <action name="PreviousWindow"><dialog>none</dialog><finalactions><action name="Focus"/><action name="Raise"/></finalactions></action>
+    </keybind>
+  </keyboard>
+  <mouse>
+    <dragThreshold>3</dragThreshold>
+    <doubleClickTime>300</doubleClickTime>
+    <context name="Frame">
+      <mousebind button="A-Left" action="Press"><action name="Focus"/><action name="Raise"/></mousebind>
+      <mousebind button="A-Left" action="Drag"><action name="Move"/></mousebind>
+      <mousebind button="A-Right" action="Drag"><action name="Resize"/></mousebind>
+    </context>
+    <context name="Titlebar">
+      <mousebind button="Left" action="Drag"><action name="Move"/></mousebind>
+      <mousebind button="Left" action="DoubleClick"><action name="ToggleMaximize"/></mousebind>
+    </context>
+    <context name="Titlebar Top Right Bottom Left TLCorner TRCorner BRCorner BLCorner">
+      <mousebind button="Left" action="Press"><action name="Focus"/><action name="Raise"/></mousebind>
+    </context>
+    <context name="Top"><mousebind button="Left" action="Drag"><action name="Resize"><edge>top</edge></action></mousebind></context>
+    <context name="Left"><mousebind button="Left" action="Drag"><action name="Resize"><edge>left</edge></action></mousebind></context>
+    <context name="Right"><mousebind button="Left" action="Drag"><action name="Resize"><edge>right</edge></action></mousebind></context>
+    <context name="Bottom"><mousebind button="Left" action="Drag"><action name="Resize"><edge>bottom</edge></action></mousebind></context>
+    <context name="TRCorner BRCorner TLCorner BLCorner">
+      <mousebind button="Left" action="Drag"><action name="Resize"/></mousebind>
+    </context>
+    <context name="Client">
+      <mousebind button="Left" action="Press"><action name="Focus"/><action name="Raise"/></mousebind>
+      <mousebind button="Middle" action="Press"><action name="Focus"/><action name="Raise"/></mousebind>
+      <mousebind button="Right" action="Press"><action name="Focus"/><action name="Raise"/></mousebind>
+    </context>
+    <context name="Icon">
+      <mousebind button="Left" action="Press"><action name="Focus"/><action name="Raise"/><action name="ShowMenu"><menu>client-menu</menu></action></mousebind>
+    </context>
+    <context name="Close">
+      <mousebind button="Left" action="Press"><action name="Focus"/><action name="Raise"/></mousebind>
+      <mousebind button="Left" action="Click"><action name="Close"/></mousebind>
+    </context>
+    <context name="Maximize">
+      <mousebind button="Left" action="Press"><action name="Focus"/><action name="Raise"/></mousebind>
+      <mousebind button="Left" action="Click"><action name="ToggleMaximize"/></mousebind>
+    </context>
+  </mouse>
+</openbox_config>
