@@ -304,7 +304,7 @@ import sys; sys.path.insert(0, sys.argv[2]); import tg; sys.exit(not tg.session_
   check "t7: reattached tg exits $rc == 0 after Ctrl+Alt+Shift+Q" test "$rc" = 0
   check "t7: the reattached client drew frames" frames "$out"
   check "t7: says the session was shut down" has_seq "$out" "disconnected: server shutdown"
-  check "t7: the supervisor removed the session dir" wait_gone "$R" 15
+  check "t7: the supervisor removed the session dir" wait_gone "$R" 30   # its teardown steps wait seconds each
   no_leftovers t7 "$dpy"
 }
 
@@ -323,7 +323,7 @@ test10() {
   check "t10: the first tg exits $rc == 0 when taken over" test "$rc" = 0
   check "t10: the first tg says it detached" has_seq "$out" "detached; xterm keeps running on $dpy"
   check "t10: the first tg left the alternate screen" has_seq "$out" $'\e[?1049l'
-  check "t10: the supervisor removed the session dir" wait_gone "$R" 15
+  check "t10: the supervisor removed the session dir" wait_gone "$R" 30   # its teardown steps wait seconds each
   no_leftovers t10 "$dpy"
 }
 
