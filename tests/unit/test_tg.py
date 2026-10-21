@@ -2,6 +2,7 @@ import io
 import os
 import shlex
 import signal
+import socket
 import stat
 import struct
 import subprocess
@@ -14,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import tg
 
 R = "/run/user/1000/tg/abcdef"
+SOCK = f"socket://{R}/x.sock"
 DESKTOP = {"seamless": False, "verbose": 0}
 SEAMLESS = {"seamless": True, "verbose": 0}
 USER = {"PATH": "/usr/bin", "HOME": "/home/u", "DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0",
@@ -47,9 +49,22 @@ class ParseArgs(unittest.TestCase):
 
     def test_no_command_is_usage_error(self):
         with self.assertRaises(tg.Usage):
-            tg.parse_args([])
-        with self.assertRaises(tg.Usage):
             tg.parse_args(["-s", "--"])
+        with self.assertRaises(tg.Usage):
+            tg.parse_args(["-v"])
+
+    def test_bare_tg_lists(self):
+        self.assertTrue(tg.parse_args([])[0]["list"])
+        self.assertFalse(tg.parse_args(["xterm"])[0]["list"])
+
+    def test_display_attaches(self):
+        opts, _ = tg.parse_args(["-v", ":177"])
+        self.assertEqual((opts["attach"], opts["verbose"]), (":177", 1))
+        self.assertIsNone(tg.parse_args(["xterm"])[0]["attach"])
+        self.assertIsNone(tg.parse_args([":x"])[0]["attach"])          # not a display: a command
+        for argv in ([":177", "xterm"], ["-s", ":177"]):
+            with self.assertRaises(tg.Usage):
+                tg.parse_args(argv)
 
     def test_unknown_option(self):
         with self.assertRaises(tg.Usage):
@@ -271,19 +286,19 @@ class ServerCmd(unittest.TestCase):
 
 class ClientCmd(unittest.TestCase):
     def test_snapshot(self):
-        self.assertEqual(tg.build_client_cmd(DESKTOP, R, []), [
-            tg.XPRA, "attach", f"socket://{R}/x.sock", "--backend=terminal", "--reconnect=no",
+        self.assertEqual(tg.build_client_cmd(DESKTOP, SOCK, []), [
+            tg.XPRA, "attach", SOCK, "--backend=terminal", "--reconnect=no",
             "--speaker=no", "--microphone=no", "--audio=no", "--webcam=no", "--notifications=no", "--printing=no",
             "--file-transfer=no", "--open-files=no", "--open-url=no", "--tray=no", "--mdns=no",
             "--shortcut-modifiers=meta+shift", "--key-shortcut=clear", "--key-shortcut=#+F4:quit"])
 
     def test_clear_before_quit(self):
-        cmd = tg.build_client_cmd(DESKTOP, R, [])
+        cmd = tg.build_client_cmd(DESKTOP, SOCK, [])
         self.assertLess(cmd.index("--key-shortcut=clear"), cmd.index("--key-shortcut=#+F4:quit"))
 
     def test_debug_only_at_vv(self):
-        self.assertNotIn("-d", tg.build_client_cmd({**DESKTOP, "verbose": 1}, R, []))
-        cmd = tg.build_client_cmd({**DESKTOP, "verbose": 2}, R, ["--x=y"])
+        self.assertNotIn("-d", tg.build_client_cmd({**DESKTOP, "verbose": 1}, SOCK, []))
+        cmd = tg.build_client_cmd({**DESKTOP, "verbose": 2}, SOCK, ["--x=y"])
         self.assertEqual(cmd[-3:], ["-d", "terminal", "--x=y"])
 
 
@@ -514,6 +529,66 @@ class RuntimeDirFiles(unittest.TestCase):
         self.assertTrue(os.path.exists(self.tmp.name + "/elsewhere/tg.pid"))
 
 
+class ListServers(unittest.TestCase):
+    def test_socket_dirs(self):
+        self.assertEqual(tg.xpra_socket_dirs({"XDG_RUNTIME_DIR": "/run/user/1000"}, "/home/u"),
+                         ["/run/user/1000/xpra", "/run/xpra", "/home/u/.xpra"])
+        self.assertEqual(tg.xpra_socket_dirs({}, "/home/u"), ["/run/xpra", "/home/u/.xpra"])
+
+    def test_parse_id(self):
+        info = tg.parse_id("display=:177\nmachine-id=\nsession-name=a=b\nWarning: junk\n")
+        self.assertEqual(info, {"display": ":177", "machine-id": "", "session-name": "a=b"})
+
+    def test_format_sorts_by_display_number(self):
+        lines = tg.format_servers([{"display": ":100", "session-type": "seamless", "session-name": "xterm"},
+                                   {"display": ":9", "session-type": "desktop"}])
+        self.assertEqual(lines, ["DISPLAY  TYPE      NAME",
+                                 ":9       desktop",
+                                 ":100     seamless  xterm"])
+
+    def test_find_sockets(self):
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="tgu") as d:
+            os.mkdir(d + "/177")
+            socks = []
+            for path in (d + "/host-100", d + "/177/socket"):
+                s = socket.socket(socket.AF_UNIX)
+                s.bind(path)
+                socks.append(s)
+            open(d + "/host-5", "w").close()                   # not a socket
+            os.symlink(d + "/host-100", d + "/host-6")          # not followed
+            try:
+                found = tg.find_sockets([d, d + "/missing"], os.getuid())
+                self.assertEqual(found, [d + "/177/socket", d + "/host-100"])
+                self.assertEqual(tg.find_sockets([d], os.getuid() + 1), [])
+                socks[0].listen()
+                self.assertTrue(tg.socket_listening(d + "/host-100"))
+                self.assertFalse(tg.socket_listening(d + "/177/socket"))
+            finally:
+                for s in socks:
+                    s.close()
+
+    def test_disconnect_reason(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".log") as f:
+            f.write("2026-10-21 17:55:12,247 running, 1 windows\n"
+                    "2026-10-21 17:55:31,485 Xpra Session Disconnected: server shutdown\n"
+                    "2026-10-21 17:55:31,485 server requested disconnect:\n")
+            f.flush()
+            self.assertEqual(tg.disconnect_reason(f.name), "server shutdown")
+        with tempfile.NamedTemporaryFile("w", suffix=".log") as f:
+            f.write("2026-10-21 17:55:21,205 quit shortcut: detaching\n")
+            f.flush()
+            self.assertIsNone(tg.disconnect_reason(f.name))
+        self.assertIsNone(tg.disconnect_reason(None))
+        self.assertIsNone(tg.disconnect_reason("/nonexistent/x.log"))
+
+    def test_nothing_running(self):
+        errs = io.StringIO()
+        with mock.patch.object(tg, "find_sockets", return_value=[]), mock.patch.object(sys, "stderr", errs), \
+                mock.patch.object(tg.subprocess, "Popen", side_effect=AssertionError("probed")):
+            self.assertEqual(tg.main([]), 0)
+        self.assertIn("no running xpra servers", errs.getvalue())
+
+
 class MainValidation(unittest.TestCase):
     def main(self, env):
         errs = io.StringIO()
@@ -526,6 +601,15 @@ class MainValidation(unittest.TestCase):
     def test_bad_timeout_and_xserver(self):
         self.assertEqual(self.main({"TG_TIMEOUT": "abc"})[0], 2)
         self.assertEqual(self.main({"TG_XSERVER": "foo"})[0], 2)
+
+    def test_attach_to_unknown_display(self):
+        errs = io.StringIO()
+        with mock.patch.object(tg, "check_terminal", return_value=None), \
+                mock.patch.object(tg, "probe_servers", return_value=[({"display": ":5"}, "/x/5")]), \
+                mock.patch.object(tg, "make_runtime_dir", side_effect=AssertionError("session started")), \
+                mock.patch.object(sys, "stderr", errs):
+            self.assertEqual(tg.main([":6"]), 2)
+        self.assertIn("no xpra server of yours answers on :6", errs.getvalue())
 
     def test_unbalanced_quotes(self):
         for var in ("TG_SERVER_ARGS", "TG_CLIENT_ARGS"):

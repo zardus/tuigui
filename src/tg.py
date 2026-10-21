@@ -16,6 +16,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 
@@ -46,11 +47,14 @@ SOCKET_BUDGET = 100       # bytes for the longest AF_UNIX path xpra creates (the
 QUICK_EXIT = 3            # seconds; an app that exits sooner probably handed off to a running instance
 TAIL_LINES = 20
 CASCADE_GRACE = 0.5     # seconds; see Session.supervise
+PROBE_TIMEOUT = 3         # seconds for `xpra id` to answer when listing servers
 
 HELP = """\
 tg - run an X11 GUI program inside this kitty terminal
 
 usage: tg [-s] [-v] [--] COMMAND [ARGS...]
+       tg [-v] :DISPLAY
+       tg
        tg --gc | --help | --version
 
 tg starts a private X server and xpra session, runs COMMAND in it and shows
@@ -58,6 +62,12 @@ it in this terminal through the kitty graphics protocol. The program fills
 the terminal and follows its size. tg exits when COMMAND exits, or when you
 press Alt+Shift+F4 to detach, which also ends COMMAND (in seamless mode only
 while COMMAND has a window).
+
+Without arguments, tg lists the running xpra servers you can attach to (in
+$XDG_RUNTIME_DIR/xpra, /run/xpra and ~/.xpra). tg's own sessions are not
+listed: their client is already attached. tg :DISPLAY attaches to one of them
+in this terminal; Alt+Shift+F4 detaches and leaves it running. A client that
+is already attached to it is disconnected.
 
 options:
   -s, --seamless   draw each X window where it is instead of one fitted desktop
@@ -67,7 +77,7 @@ options:
       --gc         clean up sessions whose tg process is gone
 
 keys inside the session:
-  Alt+Shift+F4             detach and quit
+  Alt+Shift+F4             detach and quit (tg :DISPLAY: detach only)
   Alt+Shift+n / Alt+Shift+p  next / previous window (dialogs, extra windows)
   everything else, including Ctrl+C, goes to the program
 
@@ -97,7 +107,8 @@ def err(cause, action=None):
 
 def parse_args(argv):
     """Returns (opts, cmd). Options stop at the first non-option or '--'."""
-    opts = {"seamless": False, "verbose": 0, "gc": False, "help": False, "version": False}
+    opts = {"seamless": False, "verbose": 0, "gc": False, "help": False, "version": False, "list": not argv,
+            "attach": None}
     argv = list(argv)
     i = 0
     while i < len(argv):
@@ -126,13 +137,25 @@ def parse_args(argv):
             raise Usage(f"unknown option {a!r}", "see tg --help")
         i += 1
     cmd = argv[i:]
-    if opts["help"] or opts["version"]:
+    if opts["help"] or opts["version"] or opts["list"]:
         return opts, cmd
     if opts["gc"] and cmd:
         raise Usage("--gc takes no COMMAND", "see tg --help")
+    if cmd and is_display(cmd[0]):
+        if len(cmd) > 1:
+            raise Usage(f"tg {cmd[0]} takes no COMMAND: it attaches to the programs already running there",
+                        "see tg --help")
+        if opts["seamless"]:
+            raise Usage("-s does not apply when attaching: the server decides its mode", "see tg --help")
+        opts["attach"] = cmd[0]
     if not opts["gc"] and not cmd:
         raise Usage("no COMMAND given", "see tg --help")
     return opts, cmd
+
+
+def is_display(word):
+    """':N', the form of an xpra display to attach to."""
+    return word.startswith(":") and word[1:].isdigit()
 
 
 def check_terminal(env, isatty0, isatty1):
@@ -231,14 +254,38 @@ def build_server_cmd(opts, R, w_fd, size, xserver, extra):
     return cmd + QUIET + extra
 
 
-def build_client_cmd(opts, R, extra):
+def build_client_cmd(opts, sock, extra):
     # --reconnect=no: a lost connection means the server is gone (--exit-with-client), so a re-exec'd client
     # would only print another banner on the restored tty
-    cmd = ([XPRA, "attach", f"socket://{R}/x.sock", "--backend=terminal", "--reconnect=no"]
+    cmd = ([XPRA, "attach", sock, "--backend=terminal", "--reconnect=no"]
            + CLIENT_QUIET + SHORTCUTS)
     if opts["verbose"] >= 2:
         cmd += ["-d", "terminal"]
     return cmd + extra
+
+
+def xpra_socket_dirs(env, home):
+    """xpra's default socket-dirs, as in its conf.d/10_network.conf."""
+    out = []
+    if env.get("XDG_RUNTIME_DIR"):
+        out.append(os.path.join(env["XDG_RUNTIME_DIR"], "xpra"))
+    return out + ["/run/xpra", os.path.join(home, ".xpra")]
+
+
+def parse_id(text):
+    """`xpra id` output (key=value lines) -> dict."""
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def format_servers(servers):
+    """Rows of a DISPLAY / TYPE / NAME table, one per server (dicts from parse_id), sorted by display number."""
+    def key(s):
+        d = s.get("display", "").lstrip(":")
+        return (0, int(d), "") if d.isdigit() else (1, 0, d)
+    rows = [("DISPLAY", "TYPE", "NAME")] + [(s.get("display", "?"), s.get("session-type", ""),
+                                             s.get("session-name", "")) for s in sorted(servers, key=key)]
+    w0, w1 = (max(len(r[i]) for r in rows) for i in (0, 1))
+    return [f"{a:<{w0}}  {b:<{w1}}  {c}".rstrip() for a, b, c in rows]
 
 
 def exit_status(rc):
@@ -355,6 +402,17 @@ def tail(path, n=TAIL_LINES):
 def newest(pattern):
     paths = glob.glob(pattern)
     return max(paths, key=os.path.getmtime) if paths else None
+
+
+def disconnect_reason(log):
+    """The reason in the client log's last 'Xpra Session Disconnected: REASON' line, or None."""
+    mark = "Xpra Session Disconnected:"
+    try:
+        with open(log, errors="replace") as f:
+            found = [line.split(mark, 1)[1].strip() for line in f if mark in line]
+    except (OSError, TypeError):           # TypeError: no log at all (None)
+        return None
+    return found[-1] if found else None
 
 
 class Progress:
@@ -566,7 +624,7 @@ class Session:
 
     def start_client(self):
         self.saved_tty = termios.tcgetattr(0)
-        cmd = build_client_cmd(self.opts, self.R, self.client_extra)
+        cmd = build_client_cmd(self.opts, self.sock, self.client_extra)
         self.client = subprocess.Popen(cmd, env=xpra_env(self.env, self.R, False))
         self.note(f"client pid {self.client.pid}: {shlex.join(cmd)}")
 
@@ -600,6 +658,27 @@ class Session:
             return self.app_finished()
         self.start_client()
         return self.supervise()
+
+    def attach(self, display, path):
+        """Attaches to someone else's server; nothing of it is ours to stop. Returns tg's exit status."""
+        self.sock = f"socket://{path}"
+        self.note(f"attaching to {display} at {path}")
+        self.start_client()
+        while self.client.poll() is None:
+            if self.sig:
+                self.note(f"signal {self.sig}")
+                return 128 + self.sig
+            self.wait(0.1)
+        if self.client.returncode != 0:
+            return self.client_failed()
+        # the client also exits 0 when the server shuts down, and may do so before the server removes its socket
+        reason = disconnect_reason(newest(os.path.join(self.R, "xpra", "xpra-terminal-*.log")))
+        if reason:
+            self.messages.append((f"the xpra server on {display} disconnected: {reason}.", None, None))
+        elif socket_listening(path):
+            self.messages.append((f"detached; {display} is still running.", f"run tg {display} to attach again.",
+                                  None))
+        return 0
 
     def startup_failed(self, timeout):
         if self.sig:
@@ -833,6 +912,78 @@ def gc(env):
     return 0
 
 
+# ---------- listing xpra servers ----------
+
+def find_sockets(dirs, uid):
+    """Our unix sockets in xpra's socket dirs: DIR/<host>-<display> and DIR/<display>/socket."""
+    out = []
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            for path in (os.path.join(d, name), os.path.join(d, name, "socket")):
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if stat.S_ISSOCK(st.st_mode) and st.st_uid == uid:
+                    out.append(path)
+    return out
+
+
+def socket_listening(path):
+    """Whether something accepts connections on a unix socket; `xpra id` on a dead one waits out its timeout."""
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(1)
+        try:
+            s.connect(path)
+            return True
+        except OSError:
+            return False
+
+
+def probe_servers(env):
+    """[(`xpra id` info, socket path)] of the servers that answer, once each (a server may have several sockets)."""
+    sockets = [s for s in find_sockets(xpra_socket_dirs(env, os.path.expanduser("~")), os.getuid())
+               if socket_listening(s)]
+    servers, seen = [], set()
+    if sockets:
+        # `xpra id` writes xpra.conf into its user conf dir: give it a throwaway one, as tg does for its sessions
+        with tempfile.TemporaryDirectory(prefix="tg-list-") as tmp:
+            e = {k: v for k, v in env.items() if k not in XPRA_SCRUB}
+            e.update(XDG_CONFIG_HOME=tmp, XPRA_SYSTEM_CONF_DIRS=XPRA_PREFIX + "/etc/xpra",
+                     XPRA_USER_CONF_DIRS=os.path.join(tmp, "xpra"))
+            procs = [subprocess.Popen([XPRA, "id", f"socket://{s}"], env=e, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                     for s in sockets]
+            deadline = time.monotonic() + PROBE_TIMEOUT
+            for p, s in zip(procs, sockets):
+                try:
+                    out = p.communicate(timeout=max(0, deadline - time.monotonic()))[0]
+                except subprocess.TimeoutExpired:      # a hung or dead server: not attachable
+                    p.kill()
+                    p.wait()
+                    continue
+                info = parse_id(out)
+                ident = info.get("uuid") or info.get("display")
+                if p.returncode == 0 and ident and ident not in seen:
+                    seen.add(ident)
+                    servers.append((info, s))
+    return servers
+
+
+def list_servers(env):
+    servers = [info for info, _ in probe_servers(env)]
+    if not servers:
+        err("no running xpra servers found.", "to start a program: tg COMMAND (see tg --help)")
+        return 0
+    for line in format_servers(servers):
+        print(line)
+    return 0
+
+
 # ---------- main ----------
 
 def main(argv):
@@ -850,14 +1001,23 @@ def main(argv):
     env = dict(os.environ)
     if opts["gc"]:
         return gc(env)
+    if opts["list"]:
+        return list_servers(env)
     problem = check_terminal(env, os.isatty(0), os.isatty(1))
     if problem:
         err(*problem)
         return 2
-    exe = cmd[0]
-    if not (os.access(exe, os.X_OK) if "/" in exe else shutil.which(exe)):
-        err(f"command not found: {exe}")
-        return 2
+    display = opts["attach"]
+    if display:
+        path = next((p for info, p in probe_servers(env) if info.get("display") == display), None)
+        if path is None:
+            err(f"no xpra server of yours answers on {display}.", "run tg without arguments to list them.")
+            return 2
+    else:
+        exe = cmd[0]
+        if not (os.access(exe, os.X_OK) if "/" in exe else shutil.which(exe)):
+            err(f"command not found: {exe}")
+            return 2
     try:
         timeout = float(env.get("TG_TIMEOUT", "60"))
     except ValueError:
@@ -886,7 +1046,7 @@ def main(argv):
         signal.signal(s, S.on_signal)
     code = 1                                  # an unexpected exception keeps the logs
     try:
-        code = S.run(timeout)
+        code = S.attach(display, path) if display else S.run(timeout)
     finally:
         S.teardown()
         S.note(f"exit {code}")

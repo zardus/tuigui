@@ -26,13 +26,15 @@ the first install compiles it.
 tg firefox --new-instance -P tg   # options after COMMAND belong to COMMAND
 tg -- gimp image.png
 tg -s xterm                       # seamless mode, see below
+tg                                # list the xpra servers you can attach to
+tg :100                           # attach to one of them
 ```
 
 Keys inside the session:
 
 | Key | Action |
 |---|---|
-| Alt+Shift+F4 | detach and quit (this also ends the program) |
+| Alt+Shift+F4 | detach and quit (this also ends the program, except after `tg :N`) |
 | Alt+Shift+n / Alt+Shift+p | next / previous window (dialogs, extra windows) |
 | everything else, including Ctrl+C | goes to the program |
 
@@ -49,11 +51,23 @@ Keys inside the session:
 
 ```
 tg [-s] [-v] [--] COMMAND [ARGS...]
+tg [-v] :DISPLAY
+tg
 tg --gc
 tg --help | --version
 ```
 
 Options are recognised only before COMMAND. The first non-option word or `--` ends them.
+
+Without arguments, `tg` lists the running xpra servers you can attach to: those with a socket of yours in xpra's
+default socket directories (`$XDG_RUNTIME_DIR/xpra`, `/run/xpra`, `~/.xpra`) that answer `xpra id`. `tg`'s own
+sessions are not listed, because their client is already attached.
+
+`tg :DISPLAY` attaches to one of those servers in the current kitty window, with the same client settings and keys
+as a session `tg` starts. Alt+Shift+F4 only detaches: the server and its programs keep running, and `tg` says so. A
+client already attached to that server is disconnected (xpra's default without `--sharing`). `-s` does not apply,
+and neither do the `TG_XSERVER`, `TG_TIMEOUT` and `TG_SERVER_ARGS` variables. Exit status: 0 after a detach or when
+the server shuts down, 2 if no server of yours answers on DISPLAY, 4 if the client failed.
 
 | Option | Meaning |
 |---|---|
@@ -213,7 +227,7 @@ The three test tiers:
    lines. They run in `nix flake check` and every package build.
 2. **Fake-kitty smoke test** (`tests/fakekitty/run.sh`) runs real sessions in a pty that answers kitty's queries. It
    checks the X screen size and resize, exit statuses, detach with Alt+Shift+F4, decodable frames, logs, refusals,
-   `--gc` after SIGTERM and SIGKILL, and leftovers.
+   `--gc` after SIGTERM and SIGKILL, listing and attaching to a plain xpra server, and leftovers.
 3. **Real kitty end-to-end test** (`tests/kitty/e2e.sh`) drives kitty with XTEST input. It checks the fill, typing,
    resize, the pointer, window switching, shortcuts and detach, app exit, a client crash, hangup, two concurrent
    sessions, and popup menus in a GTK program. Screenshots go to `tests/kitty/out/`.

@@ -5,13 +5,14 @@
 #   TG              tg to test, e.g. the dev-linked one from tests/dev-link.sh (required)
 #   TG_SMOKE_DIR    scratch parent, wiped at start; must be short (AF_UNIX) (default /tmp/tg-smoke-$UID).
 #                   Not TG_RUNTIME_DIR: the suite deletes it and kills every process that mentions it.
-#   TEST            any of 1 2 3 4 5 6 7 8 (default: all)
+#   TEST            any of 1 2 3 4 5 6 7 8 9 (default: all)
 #   RESIZE_AT       seconds after start when the fake terminal shrinks (default 8; raise it on a loaded host)
 #
 # Tests: 1 desktop/xdummy size, resize, exit status, frames, logs   2 client killed -> exit 4
 #        3 SIGTERM / SIGKILL to tg, then --gc                           4 seamless and xvfb variants of 1
 #        5 refusals start nothing                                     6 quick-exit hint
 #        7 Alt+Shift+F4 detach -> 0, dir removed                          8 client fails at startup -> 4, promptly
+#        9 tg lists a plain xpra server, tg :N attaches, detach leaves it running
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -240,7 +241,9 @@ test5() {
   refuse t5-notkitty "does not look like kitty" fk "$BASE/t5-notkitty.bin" \
     env -u KITTY_WINDOW_ID TG_RUNTIME_DIR="$rt" TERM=xterm-256color "$TG" "$XTERM"
   refuse t5-notty "must be the kitty terminal" env TG_RUNTIME_DIR="$rt" "$TG" "$XTERM" </dev/null
-  refuse t5-nocmd "no COMMAND" fk "$BASE/t5-nocmd.bin" env TG_RUNTIME_DIR="$rt" "$TG"
+  refuse t5-nocmd "no COMMAND" fk "$BASE/t5-nocmd.bin" env TG_RUNTIME_DIR="$rt" "$TG" -s
+  refuse t5-nodisplay "no xpra server" fk "$BASE/t5-nodisplay.bin" \
+    env TG_RUNTIME_DIR="$rt" XDG_RUNTIME_DIR="$rt" "$TG" :4242
   refuse t5-notfound "command not found" fk "$BASE/t5-notfound.bin" \
     env TG_RUNTIME_DIR="$rt" "$TG" no-such-command-xyz
   refuse t5-longdir "too long" fk "$BASE/t5-longdir.bin" env TG_RUNTIME_DIR="$long" "$TG" "$XTERM"
@@ -301,6 +304,53 @@ EOF
   [[ -n $R && $R != . ]] && rm -rf "$R"
 }
 
+# t9_display XDG_RUNTIME_DIR TIMEOUT: the display bare tg lists first
+t9_display() {
+  local end=$((SECONDS + $2)) d
+  while ((SECONDS < end)); do
+    d=$(XDG_RUNTIME_DIR=$1 "$TG" 2>/dev/null | awk 'NR == 2 { print $1 }')
+    [[ -n $d ]] && { echo "$d"; return 0; }
+    sleep 0.5
+  done
+  return 1
+}
+
+# A server started with plain xpra (not by tg): attach, detach, attach again, then stop the server under the client.
+test9() {
+  local rt=$BASE/t9 xr=$BASE/t9x out=$BASE/t9.bin rc dpy spid
+  mkdir -m 700 "$rt" "$xr"
+  env XDG_RUNTIME_DIR="$xr" XPRA_USER_CONF_DIRS="$xr/cfg" "$XPRA" start --daemon=no --socket-dirs="$xr/xpra" \
+    --xvfb="$XVFB -screen 0 1024x768x24 -nolisten tcp -noreset" --start="$XCLOCK -update 1" --session-name=t9clock \
+    --mdns=no --dbus=no --dbus-launch=no --pulseaudio=no --notifications=no --systemd-run=no \
+    --start-via-proxy=no --html=off >"$BASE/t9-server.log" 2>&1 &
+  spid=$!
+  if ! dpy=$(t9_display "$xr" 60); then fail "t9: bare tg lists the server"; kill "$spid"; wait "$spid"; return; fi
+  pass "t9: bare tg lists the server ($dpy)"
+  check "t9: the listing names the session" has_seq <(XDG_RUNTIME_DIR=$xr "$TG" 2>&1) t9clock
+
+  DUR=40 INPUT="$DETACH_KEY@10" fk "$out" env XDG_RUNTIME_DIR="$xr" TG_RUNTIME_DIR="$rt" "$TG" "$dpy"; rc=$?
+  check "t9: tg exit status $rc == 0 after Alt+Shift+F4" test "$rc" = 0
+  check "t9: alternate screen left, keyboard flags popped" has_seq "$out" $'\e[?1049l' $'\e[<u'
+  check "t9: an inline frame decodes" frames "$out"
+  check "t9: says the server is still running" has_seq "$out" "still running"
+  check "t9: the server survived the detach" kill -0 "$spid"
+  check "t9: session dir removed" test -z "$(find "$rt" -mindepth 1 -maxdepth 1 -type d)"
+
+  out=$BASE/t9b.bin
+  DUR=40 fk "$out" env XDG_RUNTIME_DIR="$xr" TG_RUNTIME_DIR="$rt" "$TG" "$dpy" &
+  local fkpid=$!
+  sleep 10
+  XDG_RUNTIME_DIR=$xr XPRA_USER_CONF_DIRS=$xr/cfg "$XPRA" stop "socket://$(compgen -G "$xr/xpra/*-${dpy#:}")" \
+    >/dev/null 2>&1
+  wait "$fkpid"; rc=$?
+  info "t9: tg exit status $rc after the server was stopped under it"
+  check "t9: alternate screen left after the server went away" has_seq "$out" $'\e[?1049l'
+  check "t9: no 'still running' claim" test -z "$(grep -aF "still running" "$out")"
+  check "t9: says the server shut down" has_seq "$out" "disconnected: server shutdown"
+  wait "$spid"
+  no_leftovers t9 "$dpy"
+}
+
 cleanup() {
   local pids
   mapfile -t pids < <(procs "$BASE/")
@@ -312,10 +362,11 @@ main() {
   [[ -x $TG ]] || { echo "TG=$TG is not executable"; exit 2; }
   rm -rf "$BASE" && (umask 077 && mkdir -p "$BASE")
   XRANDR=$(nixbin xrandr xrandr) XTERM=$(nixbin xterm xterm) XCLOCK=$(nixbin xclock xclock)
+  XPRA=$(sed -n 's/^XPRA_PREFIX = "\(.*\)"$/\1/p' "$TG")/bin/xpra XVFB=$(sed -n 's/^XVFB = "\(.*\)"$/\1/p' "$TG")
   SHM_BEFORE=$(shm_objects)
   trap cleanup EXIT
   local tests=("$@") t
-  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8)
+  ((${#tests[@]})) || tests=(1 2 3 4 5 6 7 8 9)
   for t in "${tests[@]}"; do echo "== test $t"; "test$t"; done
   echo "== $PASSES passed, $FAILS failed (outputs in $BASE)"
   ((FAILS == 0))
